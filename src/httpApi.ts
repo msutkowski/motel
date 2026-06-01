@@ -28,6 +28,21 @@ const Health = Schema.Struct({
 })
 const IngestTraceResponse = Schema.Struct({ insertedSpans: Schema.Number })
 const IngestLogResponse = Schema.Struct({ insertedLogs: Schema.Number })
+const DbStats = Schema.Struct({
+	databasePath: Schema.String,
+	fileBytes: Schema.Number,
+	walBytes: Schema.Number,
+	pageCount: Schema.Number,
+	freelistPages: Schema.Number,
+	pageSizeBytes: Schema.Number,
+	effectiveBytes: Schema.Number,
+	traceCount: Schema.Number,
+	spanCount: Schema.Number,
+	logCount: Schema.Number,
+	oldestTraceStartedAtMs: Schema.NullOr(Schema.Number),
+	retentionHours: Schema.Number,
+	maxDbSizeMb: Schema.Number,
+}).annotate({ identifier: "DbStats" })
 const DocIndex = Schema.Struct({
 	docs: Schema.Array(Schema.Struct({
 		name: Schema.String.pipe(Schema.annotateKey({ description: "Document identifier used in the URL path" })),
@@ -78,6 +93,10 @@ export const MotelHttpApi = HttpApi.make("MotelTelemetry")
 				HttpApiEndpoint.get("health", "/api/health", { success: Health })
 					.annotate(OpenApi.Summary, "Health check and identity handshake")
 					.annotate(OpenApi.Description, "Returns liveness plus identity fields (pid, url, workdir, startedAt, version). Doubles as the MCP discovery handshake: clients compare the returned pid against a registry entry to detect stale registrations that now point at an impostor process on the same port."),
+
+				HttpApiEndpoint.get("dbStats", "/api/db-stats", { success: DbStats })
+					.annotate(OpenApi.Summary, "Database size and row counts")
+					.annotate(OpenApi.Description, "Returns on-disk file size, WAL size, SQLite page accounting, per-table row counts, and the configured retention/size caps. Use this to monitor whether vacuum is keeping up with ingest or whether retention should be tightened."),
 
 				HttpApiEndpoint.post("ingestTraces", "/v1/traces", {
 					payload: Schema.Unknown,

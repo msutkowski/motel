@@ -2,11 +2,10 @@ import * as fs from "node:fs"
 import { promises as fsp } from "node:fs"
 import * as path from "node:path"
 import { Effect } from "effect"
+import { config } from "./config.js"
 import { isAlive, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, MOTEL_VERSION, type RegistryEntry } from "./registry.js"
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
-const DEFAULT_HOST = "127.0.0.1"
-const DEFAULT_PORT = 27686
 const START_TIMEOUT_MS = 30_000
 const STOP_TIMEOUT_MS = 10_000
 const LOCK_TIMEOUT_MS = 10_000
@@ -102,8 +101,8 @@ const resolveConfig = (options: DaemonOptions = {}): DaemonConfig => {
 	const workdir = path.resolve(options.workdir ?? process.cwd())
 	const runtimeDir = path.resolve(options.runtimeDir ?? motelStateDir())
 	const databasePath = path.resolve(options.databasePath ?? path.join(runtimeDir, "telemetry.sqlite"))
-	const host = options.host ?? DEFAULT_HOST
-	const port = options.port ?? DEFAULT_PORT
+	const host = options.host ?? config.otel.host
+	const port = options.port ?? config.otel.port
 	return {
 		repoRoot,
 		serverEntry: path.join(repoRoot, "src/server.ts"),
@@ -558,3 +557,30 @@ export const applyManagedDaemonEnv = Effect.suspend(() => createDaemonManager().
 export const getManagedDaemonStatus = Effect.suspend(() => createDaemonManager().getStatus)
 export const ensureManagedDaemon = Effect.suspend(() => createDaemonManager().ensure)
 export const stopManagedDaemon = Effect.suspend(() => createDaemonManager().stop)
+
+/**
+ * Wipe the local telemetry SQLite database and restart the managed
+ * daemon on a fresh file. Used by `motel reset` when the DB has grown
+ * past what retention can keep up with (or just to start clean).
+ *
+ * Sequence: stop the daemon → delete `telemetry.sqlite` + `-wal` +
+ * `-shm` → start a fresh daemon. If the stop step fails (commonly: the
+ * daemon is wedged and ignoring SIGTERM), bail without deleting; the
+ * user needs to SIGKILL the wedged pid manually, otherwise the surviving
+ * process has the old DB mmap'd and a fresh start would race over the
+ * shared port.
+ */
+export const resetManagedDaemon = Effect.gen(function* () {
+	const manager = createDaemonManager()
+	const config = resolveConfig()
+	yield* manager.stop
+	yield* Effect.sync(() => {
+		for (const suffix of ["", "-wal", "-shm"]) {
+			try { fs.unlinkSync(`${config.databasePath}${suffix}`) } catch (error) {
+				const errno = error as NodeJS.ErrnoException
+				if (errno.code !== "ENOENT") throw error
+			}
+		}
+	})
+	return yield* manager.ensure
+})

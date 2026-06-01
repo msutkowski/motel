@@ -17,6 +17,7 @@ import { TelemetryStore, TelemetryStoreLive, TelemetryStoreReadonlyLive } from "
 import { TraceQueryService, TraceQueryServiceLive } from "./services/TraceQueryService.js"
 import type { LogItem, TraceItem, TraceSummaryItem } from "./domain.js"
 import { lifecycleLabel } from "./ui/format.js"
+import { decodeLogsExportRequest, decodeTraceExportRequest, isGzipContentEncoding, isProtobufContentType, maybeGunzip } from "./otlpProto.js"
 
 // Set by the RegistryLayer acquisition once the Bun socket has bound.
 // Both /api/health and the registry entry read from here so they agree
@@ -56,6 +57,35 @@ const respondRaw = <R>(effect: Effect.Effect<ReturnType<typeof jsonResponse>, un
 		onFailure: (error) => jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 500),
 		onSuccess: (value) => value,
 	})
+
+type OtlpRequest = {
+	readonly headers: Record<string, string | undefined>
+	readonly arrayBuffer: Effect.Effect<ArrayBuffer, unknown>
+	readonly json: Effect.Effect<unknown, unknown>
+}
+
+/**
+ * Resolve an incoming OTLP/HTTP body to a JS payload, honoring both the
+ * content type (JSON vs protobuf) and `Content-Encoding: gzip`. Most
+ * non-JS exporters (Erlang/Elixir, the OTel Node SDK above ~1KB) gzip
+ * by default; without this, those requests fail with `Unexpected token`
+ * from `JSON.parse` or a protobuf decode error.
+ */
+const readOtlpBody = <A>(
+	request: OtlpRequest,
+	decodeProto: (bytes: Uint8Array) => A,
+): Effect.Effect<unknown, unknown> => {
+	const contentType = request.headers["content-type"]
+	const contentEncoding = request.headers["content-encoding"]
+	const readBytes = Effect.map(request.arrayBuffer, (buf) => maybeGunzip(new Uint8Array(buf), contentEncoding))
+	if (isProtobufContentType(contentType)) {
+		return Effect.map(readBytes, (bytes) => decodeProto(bytes) as unknown)
+	}
+	if (isGzipContentEncoding(contentEncoding)) {
+		return Effect.map(readBytes, (bytes) => JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown)
+	}
+	return request.json
+}
 
 const parseLimit = (value: string | null, fallback: number) => parsePositiveInt(value ?? undefined, fallback)
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(value, max))
@@ -278,7 +308,7 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 	(handlers) =>
 		handlers
 			.handleRaw("root", () =>
-				Effect.succeed(textResponse("motel local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/facets?type=logs&field=severity\nGET /api/docs\nGET /api/docs/<name>\nGET /openapi.json\nGET /docs\nGET /trace/<trace-id>\n")),
+				Effect.succeed(textResponse("motel local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nGET /api/health\nGET /api/db-stats\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/facets?type=logs&field=severity\nGET /api/docs\nGET /api/docs/<name>\nGET /openapi.json\nGET /docs\nGET /trace/<trace-id>\n")),
 			)
 			.handle("health", () =>
 				Effect.succeed({
@@ -292,27 +322,32 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 					version: MOTEL_VERSION,
 				}),
 			)
+			.handle("dbStats", () => Effect.orDie(withTraceQuery((store) => store.databaseStats)))
 			// OTLP ingest is routed to the worker thread via AsyncIngest
 			// so the main event loop stays free during heavy SQLite writes.
 			// Everything else still uses the direct TelemetryStore — reads
 			// are fast enough that IPC overhead isn't worth paying.
 			.handleRaw("ingestTraces", ({ request }) =>
 				respondRaw(
-					Effect.flatMap(request.json, (payload) =>
-						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload })),
-							(result) => jsonResponse(result),
-						),
+					Effect.flatMap(
+						readOtlpBody(request, decodeTraceExportRequest),
+						(payload) =>
+							Effect.map(
+								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload: payload as never })),
+								(result) => jsonResponse(result),
+							),
 					),
 				),
 			)
 			.handleRaw("ingestLogs", ({ request }) =>
 				respondRaw(
-					Effect.flatMap(request.json, (payload) =>
-						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload })),
-							(result) => jsonResponse(result),
-						),
+					Effect.flatMap(
+						readOtlpBody(request, decodeLogsExportRequest),
+						(payload) =>
+							Effect.map(
+								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload: payload as never })),
+								(result) => jsonResponse(result),
+							),
 					),
 				),
 			)

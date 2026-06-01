@@ -118,3 +118,6 @@ export const loadTraceLogs = (traceId: string) =>
 
 export const loadServiceLogs = (serviceName: string) =>
 	queryRuntime.runPromise(Effect.flatMap(LogQueryService.asEffect(), (service) => service.listRecentLogs(serviceName)))
+
+export const loadDatabaseStats = () =>
+	queryRuntime.runPromise(Effect.flatMap(TraceQueryService.asEffect(), (service) => service.databaseStats))

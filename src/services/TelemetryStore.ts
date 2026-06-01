@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite"
-import { mkdirSync } from "node:fs"
+import { mkdirSync, statSync } from "node:fs"
 import { dirname } from "node:path"
 import { Clock, Effect, Layer, Schedule, Context } from "effect"
 import { config } from "../config.js"
@@ -446,8 +446,31 @@ export class TelemetryStore extends Context.Service<
 		readonly searchAiCalls: (input: AiCallSearch) => Effect.Effect<readonly AiCallSummary[], Error>
 		readonly getAiCall: (spanId: string) => Effect.Effect<AiCallDetail | null, Error>
 		readonly aiCallStats: (input: AiCallStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
+		readonly databaseStats: Effect.Effect<DatabaseStats, Error>
 	}
 >()("motel/TelemetryStore") {}
+
+/**
+ * Summary of on-disk + in-DB storage state. Used by the TUI footer and
+ * the `/api/db-stats` endpoint. All sizes are bytes, all timestamps are
+ * milliseconds since epoch. `effectiveBytes` excludes freelist pages so
+ * a partially-vacuumed DB reports the size of actual data, not headroom.
+ */
+export interface DatabaseStats {
+	readonly databasePath: string
+	readonly fileBytes: number
+	readonly walBytes: number
+	readonly pageCount: number
+	readonly freelistPages: number
+	readonly pageSizeBytes: number
+	readonly effectiveBytes: number
+	readonly traceCount: number
+	readonly spanCount: number
+	readonly logCount: number
+	readonly oldestTraceStartedAtMs: number | null
+	readonly retentionHours: number
+	readonly maxDbSizeMb: number
+}
 
 
 /**
@@ -2414,6 +2437,38 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			})
 		})
 
+		const fileBytesOrZero = (path: string): number => {
+			try { return statSync(path).size } catch { return 0 }
+		}
+
+		const databaseStats = Effect.fn("motel/TelemetryStore.databaseStats")(function* () {
+			return yield* Effect.sync((): DatabaseStats => {
+				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
+				const freelistPages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
+				const pageSizeBytes = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
+				const effectiveBytes = Math.max(0, (pageCount - freelistPages) * pageSizeBytes)
+				const traceCount = (db.query(`SELECT COUNT(*) AS c FROM trace_summaries`).get() as { c: number }).c
+				const spanCount = (db.query(`SELECT COUNT(*) AS c FROM spans`).get() as { c: number }).c
+				const logCount = (db.query(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c
+				const oldest = db.query(`SELECT MIN(started_at_ms) AS m FROM trace_summaries`).get() as { m: number | null } | undefined
+				return {
+					databasePath: config.otel.databasePath,
+					fileBytes: fileBytesOrZero(config.otel.databasePath),
+					walBytes: fileBytesOrZero(`${config.otel.databasePath}-wal`),
+					pageCount,
+					freelistPages,
+					pageSizeBytes,
+					effectiveBytes,
+					traceCount,
+					spanCount,
+					logCount,
+					oldestTraceStartedAtMs: oldest?.m ?? null,
+					retentionHours: config.otel.retentionHours,
+					maxDbSizeMb: config.otel.maxDbSizeMb,
+				}
+			})
+		})()
+
 		return TelemetryStore.of({
 			ingestTraces,
 			ingestLogs,
@@ -2435,6 +2490,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			searchAiCalls,
 			getAiCall,
 			aiCallStats,
+			databaseStats,
 		})
 	}),
 )

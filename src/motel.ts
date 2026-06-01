@@ -1,7 +1,13 @@
 #!/usr/bin/env bun
 
+// MUST come before any import that transitively pulls in ./config.js
+// (e.g. ./daemon.js below). The bootstrap fills MOTEL_OTEL_* env from
+// the live daemon registry so URL helpers in the TUI point at the
+// actually-running daemon, not the default port.
+import "./registryEnvBootstrap.js"
+
 import { Effect } from "effect"
-import { applyManagedDaemonEnv, ensureManagedDaemon, getManagedDaemonStatus, stopManagedDaemon } from "./daemon.js"
+import { applyManagedDaemonEnv, ensureManagedDaemon, getManagedDaemonStatus, resetManagedDaemon, stopManagedDaemon } from "./daemon.js"
 
 const [command, ...args] = process.argv.slice(2)
 
@@ -31,6 +37,15 @@ case "status": {
 
 case "stop": {
 	const status = await run(stopManagedDaemon)
+	console.log(JSON.stringify(status, null, 2))
+	break
+}
+
+case "reset": {
+	// Destructive: stops the daemon, deletes the SQLite database, and
+	// starts a fresh daemon. Useful when retention can't keep up or
+	// you just want to start clean.
+	const status = await run(resetManagedDaemon)
 	console.log(JSON.stringify(status, null, 2))
 	break
 }
@@ -66,6 +81,7 @@ case "-h": {
 	motel status
 	motel stop
 	motel restart
+	motel reset
 	motel server
 	motel mcp
 	motel services

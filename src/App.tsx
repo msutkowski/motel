@@ -2,7 +2,8 @@ import { RGBA, TextAttributes } from "@opentui/core"
 import { useAtom } from "@effect/atom-react"
 import { useTerminalDimensions } from "@opentui/react"
 import { useCallback, useEffect, useMemo, useRef } from "react"
-import { formatTimestamp } from "./ui/format.ts"
+import { formatBytes, formatTimestamp } from "./ui/format.ts"
+import { loadDatabaseStats } from "./ui/loaders.ts"
 import { Divider, FooterHints, HelpModal, PlainLine, SplitDivider, TextLine } from "./ui/primitives.tsx"
 import { useAppLayout } from "./ui/app/useAppLayout.ts"
 import { useTraceScreenData } from "./ui/app/useTraceScreenData.ts"
@@ -16,6 +17,7 @@ import {
 	attrFacetStateAtom,
 	chatDetailChunkIdAtom,
 	chatDetailScrollOffsetAtom,
+	dbStatsAtom,
 	noticeAtom,
 	persistSelectedTheme,
 	selectedAttrIndexAtom,
@@ -43,6 +45,7 @@ const buildHeaderModel = ({
 	autoRefresh,
 	fetchedAt,
 	status,
+	dbStats,
 }: {
 	readonly headerFooterWidth: number
 	readonly selectedTraceService: string | null
@@ -51,17 +54,24 @@ const buildHeaderModel = ({
 	readonly autoRefresh: boolean
 	readonly fetchedAt: Date | null
 	readonly status: string
+	readonly dbStats: { readonly effectiveBytes: number; readonly maxDbSizeMb: number } | null
 }) => {
 	const serviceLabel = selectedTraceService ?? "none"
 	const autoLabel = autoRefresh ? "● live" : "○ paused"
 	const attrFilterLabel = activeAttrKey && activeAttrValue
 		? `  [${activeAttrKey}=${activeAttrValue.length > 20 ? `${activeAttrValue.slice(0, 19)}…` : activeAttrValue}]`
 		: ""
-	const right = fetchedAt
+	// Show effective (post-freelist) size, not on-disk file size — the
+	// freelist headroom is what vacuum will reclaim anyway, so users
+	// care about the data footprint when deciding to reset.
+	const dbLabel = dbStats ? `db ${formatBytes(dbStats.effectiveBytes)}` : ""
+	const dbOverCap = dbStats !== null && dbStats.effectiveBytes > dbStats.maxDbSizeMb * 1024 * 1024
+	const timingRight = fetchedAt
 		? `${autoLabel}  ${formatTimestamp(fetchedAt)}`
 		: status === "loading"
 			? "loading traces..."
 			: ""
+	const right = dbLabel && timingRight ? `${dbLabel}  ${timingRight}` : (dbLabel || timingRight)
 	const leftLength = "MOTEL".length + SEPARATOR.length + serviceLabel.length + attrFilterLabel.length
 	const gap = Math.max(2, headerFooterWidth - leftLength - right.length)
 
@@ -70,6 +80,9 @@ const buildHeaderModel = ({
 		attrFilterLabel,
 		right,
 		gap,
+		dbLabel,
+		dbOverCap,
+		timingRight,
 	} as const
 }
 
@@ -77,12 +90,17 @@ const AppHeader = ({
 	serviceLabel,
 	attrFilterLabel,
 	gap,
-	right,
+	dbLabel,
+	dbOverCap,
+	timingRight,
 }: {
 	readonly serviceLabel: string
 	readonly attrFilterLabel: string
 	readonly gap: number
 	readonly right: string
+	readonly dbLabel: string
+	readonly dbOverCap: boolean
+	readonly timingRight: string
 }) => (
 	<box paddingLeft={1} paddingRight={1} flexDirection="column">
 		<TextLine>
@@ -91,7 +109,9 @@ const AppHeader = ({
 			<span fg={colors.muted}>{serviceLabel}</span>
 			{attrFilterLabel ? <span fg={colors.accent} attributes={TextAttributes.BOLD}>{attrFilterLabel}</span> : null}
 			<span fg={colors.muted}>{" ".repeat(gap)}</span>
-			<span fg={colors.muted} attributes={TextAttributes.BOLD}>{right}</span>
+			{dbLabel ? <span fg={dbOverCap ? colors.error : colors.muted} attributes={TextAttributes.BOLD}>{dbLabel}</span> : null}
+			{dbLabel && timingRight ? <span fg={colors.muted}>{"  "}</span> : null}
+			<span fg={colors.muted} attributes={TextAttributes.BOLD}>{timingRight}</span>
 		</TextLine>
 	</box>
 )
@@ -269,6 +289,22 @@ export const App = () => {
 		startupBenchMark("app_effects_committed")
 	}, [])
 
+	// DB-size indicator. Refreshes every 5s on its own cadence — the
+	// underlying queries are PRAGMA + COUNT(*), but they still hit the
+	// reader lock, so don't piggy-back on the per-tick trace refresh.
+	const [dbStats, setDbStats] = useAtom(dbStatsAtom)
+	useEffect(() => {
+		let cancelled = false
+		const tick = () => {
+			loadDatabaseStats()
+				.then((stats) => { if (!cancelled) setDbStats(stats) })
+				.catch(() => { /* daemon may be restarting; leave the last reading in place */ })
+		}
+		tick()
+		const handle = setInterval(tick, 5000)
+		return () => { cancelled = true; clearInterval(handle) }
+	}, [setDbStats])
+
 	const { spanNavActive } = useKeyboardNav({
 		selectedTrace,
 		filteredTraces,
@@ -289,6 +325,7 @@ export const App = () => {
 		autoRefresh,
 		fetchedAt: traceState.fetchedAt,
 		status: traceState.status,
+		dbStats,
 	})
 
 	const selectTraceById = useCallback((traceId: string) => {
