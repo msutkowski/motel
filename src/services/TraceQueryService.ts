@@ -1,6 +1,6 @@
 import { Effect, Layer, Context } from "effect"
 import type { AiCallDetail, SpanItem, TraceItem, TraceSummaryItem } from "../domain.js"
-import { TelemetryStore } from "./TelemetryStore.js"
+import { TelemetryStore, type DatabaseStats } from "./TelemetryStore.js"
 
 export class TraceQueryService extends Context.Service<
 	TraceQueryService,
@@ -17,6 +17,7 @@ export class TraceQueryService extends Context.Service<
 		readonly getAiCall: (spanId: string) => Effect.Effect<AiCallDetail | null, Error>
 		readonly listTraceSpans: (traceId: string) => Effect.Effect<readonly SpanItem[], Error>
 		readonly searchSpans: (input: { readonly serviceName?: string | null; readonly traceId?: string | null; readonly operation?: string | null; readonly parentOperation?: string | null; readonly status?: "ok" | "error" | null; readonly lookbackMinutes?: number; readonly limit?: number; readonly attributeFilters?: Readonly<Record<string, string>>; readonly attributeContainsFilters?: Readonly<Record<string, string>> }) => Effect.Effect<readonly SpanItem[], Error>
+		readonly databaseStats: Effect.Effect<DatabaseStats, Error>
 	}
 >()("motel/TraceQueryService") {}
 
@@ -72,6 +73,7 @@ export const TraceQueryServiceLive = Layer.effect(
 			getAiCall: store.getAiCall,
 			listTraceSpans: store.listTraceSpans,
 			searchSpans: store.searchSpans,
+			databaseStats: store.databaseStats,
 		})
 	}),
 )

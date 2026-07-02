@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs"
 import path from "node:path"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { config, parsePositiveInt } from "./config.js"
 import { HttpApiBuilder, HttpApiScalar } from "effect/unstable/httpapi"
 import * as HttpMiddleware from "effect/unstable/http/HttpMiddleware"
@@ -12,11 +12,13 @@ import { MotelHttpApi } from "./httpApi.js"
 import { attributeFiltersFromEntries, attributeContainsFiltersFromEntries } from "./queryFilters.js"
 import { MOTEL_SERVICE_ID, MOTEL_VERSION, removeRegistryEntry, writeRegistryEntry } from "./registry.js"
 import { AsyncIngest, AsyncIngestLive } from "./services/AsyncIngest.js"
+import { IngestError } from "./services/ingestRpc.js"
 import { LogQueryService, LogQueryServiceLive } from "./services/LogQueryService.js"
 import { TelemetryStore, TelemetryStoreLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
 import { TraceQueryService, TraceQueryServiceLive } from "./services/TraceQueryService.js"
 import type { LogItem, TraceItem, TraceSummaryItem } from "./domain.js"
 import { lifecycleLabel } from "./ui/format.js"
+import { decodeLogsExportRequest, decodeTraceExportRequest, isGzipContentEncoding, isProtobufContentType, maybeGunzip } from "./otlpProto.js"
 
 // Set by the RegistryLayer acquisition once the Bun socket has bound.
 // Both /api/health and the registry entry read from here so they agree
@@ -56,6 +58,35 @@ const respondRaw = <R>(effect: Effect.Effect<ReturnType<typeof jsonResponse>, un
 		onFailure: (error) => jsonResponse({ error: error instanceof Error ? error.message : String(error) }, 500),
 		onSuccess: (value) => value,
 	})
+
+type OtlpRequest = {
+	readonly headers: Record<string, string | undefined>
+	readonly arrayBuffer: Effect.Effect<ArrayBuffer, unknown>
+	readonly json: Effect.Effect<unknown, unknown>
+}
+
+/**
+ * Resolve an incoming OTLP/HTTP body to a JS payload, honoring both the
+ * content type (JSON vs protobuf) and `Content-Encoding: gzip`. Most
+ * non-JS exporters (Erlang/Elixir, the OTel Node SDK above ~1KB) gzip
+ * by default; without this, those requests fail with `Unexpected token`
+ * from `JSON.parse` or a protobuf decode error.
+ */
+const readOtlpBody = <A>(
+	request: OtlpRequest,
+	decodeProto: (bytes: Uint8Array) => A,
+): Effect.Effect<unknown, unknown> => {
+	const contentType = request.headers["content-type"]
+	const contentEncoding = request.headers["content-encoding"]
+	const readBytes = Effect.map(request.arrayBuffer, (buf) => maybeGunzip(new Uint8Array(buf), contentEncoding))
+	if (isProtobufContentType(contentType)) {
+		return Effect.map(readBytes, (bytes) => decodeProto(bytes) as unknown)
+	}
+	if (isGzipContentEncoding(contentEncoding)) {
+		return Effect.map(readBytes, (bytes) => JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown)
+	}
+	return request.json
+}
 
 const parseLimit = (value: string | null, fallback: number) => parsePositiveInt(value ?? undefined, fallback)
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(value, max))
@@ -272,13 +303,31 @@ pre { white-space:pre-wrap; margin:0; color:#ede7da; }
 </html>`
 }
 
+// Fail-fast guard on the ingest worker round-trip. The worker RPC queue is
+// unbounded and FIFO: when the worker falls behind (SQLite degradation,
+// runaway DB growth), every OTLP POST otherwise waits in line indefinitely —
+// measured at 3+ DAYS during the retention-wedge incident — while the
+// exporter on the other end times out, abandons its socket, and opens a new
+// one on the next flush. Thousands of half-dead connections later, the
+// machine runs out of ephemeral ports. Shedding load with a 500 instead lets
+// OTLP clients complete the request cycle (drop the batch, reuse or close
+// the connection cleanly) and keeps the socket count flat. The timeout also
+// interrupts the queued RPC so abandoned work doesn't keep the worker busy.
+const INGEST_SHED_TIMEOUT = Duration.seconds(30)
+const shedIngestLoad = (method: string) =>
+	Effect.fail(
+		new IngestError({
+			message: `${method} timed out after ${Duration.toSeconds(INGEST_SHED_TIMEOUT)}s — ingest worker is backlogged; batch dropped`,
+		}),
+	)
+
 const TelemetryGroupLive = HttpApiBuilder.group(
 	MotelHttpApi,
 	"telemetry",
 	(handlers) =>
 		handlers
 			.handleRaw("root", () =>
-				Effect.succeed(textResponse("motel local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/facets?type=logs&field=severity\nGET /api/docs\nGET /api/docs/<name>\nGET /openapi.json\nGET /docs\nGET /trace/<trace-id>\n")),
+				Effect.succeed(textResponse("motel local telemetry server\n\nPOST /v1/traces\nPOST /v1/logs\nGET /api/health\nGET /api/db-stats\nGET /api/services\nGET /api/traces\nGET /api/traces/search\nGET /api/traces/stats\nGET /api/traces/<trace-id>\nGET /api/traces/<trace-id>/spans\nGET /api/traces/<trace-id>/logs\nGET /api/spans/search\nGET /api/spans/<span-id>\nGET /api/spans/<span-id>/logs\nGET /api/logs\nGET /api/logs/search\nGET /api/logs/stats\nGET /api/ai/calls\nGET /api/ai/calls/<span-id>\nGET /api/ai/stats\nGET /api/facets?type=logs&field=severity\nGET /api/docs\nGET /api/docs/<name>\nGET /openapi.json\nGET /docs\nGET /trace/<trace-id>\n")),
 			)
 			.handle("health", () =>
 				Effect.succeed({
@@ -292,27 +341,36 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 					version: MOTEL_VERSION,
 				}),
 			)
+			.handle("dbStats", () => Effect.orDie(withTraceQuery((store) => store.databaseStats)))
 			// OTLP ingest is routed to the worker thread via AsyncIngest
 			// so the main event loop stays free during heavy SQLite writes.
 			// Everything else still uses the direct TelemetryStore — reads
 			// are fast enough that IPC overhead isn't worth paying.
 			.handleRaw("ingestTraces", ({ request }) =>
 				respondRaw(
-					Effect.flatMap(request.json, (payload) =>
-						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload })),
-							(result) => jsonResponse(result),
-						),
+					Effect.flatMap(
+						readOtlpBody(request, decodeTraceExportRequest),
+						(payload) =>
+							Effect.map(
+								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload: payload as never })).pipe(
+									Effect.timeoutOrElse({ duration: INGEST_SHED_TIMEOUT, orElse: () => shedIngestLoad("ingestTraces") }),
+								),
+								(result) => jsonResponse(result),
+							),
 					),
 				),
 			)
 			.handleRaw("ingestLogs", ({ request }) =>
 				respondRaw(
-					Effect.flatMap(request.json, (payload) =>
-						Effect.map(
-							Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload })),
-							(result) => jsonResponse(result),
-						),
+					Effect.flatMap(
+						readOtlpBody(request, decodeLogsExportRequest),
+						(payload) =>
+							Effect.map(
+								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload: payload as never })).pipe(
+									Effect.timeoutOrElse({ duration: INGEST_SHED_TIMEOUT, orElse: () => shedIngestLoad("ingestLogs") }),
+								),
+								(result) => jsonResponse(result),
+							),
 					),
 				),
 			)
@@ -693,5 +751,12 @@ export const ServerLive = HttpRouter.serve(
 		port: config.otel.port,
 		hostname: config.otel.host,
 		reusePort: true,
+		// Reap idle keep-alive connections. OTLP exporters that time out
+		// client-side abandon their sockets without closing them; with no
+		// idle timeout those accumulate forever (observed: 15k ESTABLISHED
+		// loopback connections → machine-wide ephemeral-port exhaustion).
+		// 120s is far above any healthy request/flush interval. Applies to
+		// HTTP connections only — websockets negotiate their own lifecycle.
+		idleTimeout: 120,
 	})),
 )
