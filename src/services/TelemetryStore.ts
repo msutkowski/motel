@@ -926,6 +926,15 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		const VACUUM_PAGES_BUSY = 20000      // ~80MB/pass — used when freelist > 20%
 		const VACUUM_PAGES_PANIC = 50000     // ~200MB/pass — only when ratio > 50%
 
+		// Hard cap on traces evicted in a single cleanup pass. Eviction runs
+		// inside one synchronous Effect.sync on the main thread — an uncapped
+		// pass against a huge backlog (e.g. 2.6M summaries after retention has
+		// been down) would block the event loop for the entire sweep, freeze
+		// /api/*, and hold the write lock against the ingest worker for the
+		// duration. 5000 traces ≈ 10 delete batches ≈ a few seconds per pass;
+		// the 60s repeat cadence drains any backlog incrementally instead.
+		const EVICT_MAX_TRACES_PER_PASS = 5000
+
 		const ftsTableNames = ["span_attr_fts", "log_body_fts", "span_operation_fts"] as const
 
 		const incrementalFtsMerge = (pages: number) => {
@@ -942,6 +951,13 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 		const reclaimSpace = Effect.fn("motel/TelemetryStore.reclaimSpace")(function* () {
 			yield* Effect.sync(() => {
+				// This pass runs under Effect.repeat, which STOPS repeating the
+				// moment the effect fails. A single uncaught SQLITE_BUSY (routine
+				// when the ingest worker holds the write lock past busy_timeout)
+				// would therefore kill page reclamation for the life of the
+				// process — silently. Never let an error escape a maintenance
+				// pass; log and let the next tick retry.
+				try {
 				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
 				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
 				if (pageCount === 0) return
@@ -967,6 +983,9 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				// has grown.
 				const mode = ratio >= FREELIST_HIGH_RATIO ? "TRUNCATE" : "RESTART"
 				try { db.exec(`PRAGMA wal_checkpoint(${mode});`) } catch { /* ignore */ }
+				} catch (err) {
+					console.warn(`motel: reclaimSpace pass failed (will retry next tick): ${(err as Error).message}`)
+				}
 			})
 		})
 
@@ -974,6 +993,14 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			const now = yield* Clock.currentTimeMillis
 
 			yield* Effect.sync(() => {
+				// Same contract as reclaimSpace: this body must NEVER throw.
+				// Effect.repeat stops on the first failure, and this loop is the
+				// only thing standing between the database and unbounded growth —
+				// a single SQLITE_BUSY here once killed retention silently and
+				// let the DB grow to 25GB (25x the cap), which backed ingest up
+				// by days and exhausted the machine's ephemeral ports with hung
+				// OTLP connections. Log, skip the pass, retry in 60s.
+				try {
 				const cutoff = now - config.otel.retentionHours * 60 * 60 * 1000
 
 				// Evict at TRACE granularity so we never leave a trace half-gutted
@@ -984,8 +1011,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				const toEvict = new Set<string>()
 
 				// Time-based: completed traces whose last span ended before cutoff.
+				// Oldest first and capped, so a large backlog (server restarted
+				// after days down, or retention recovering from a wedge) drains
+				// across passes instead of freezing one pass for its entirety.
 				const timeExpired = db.query(
-					`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ?`,
+					`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ? ORDER BY ended_at_ms ASC LIMIT ${EVICT_MAX_TRACES_PER_PASS}`,
 				).all(cutoff) as readonly { trace_id: string }[]
 				for (const row of timeExpired) toEvict.add(row.trace_id)
 
@@ -1001,7 +1031,7 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					const completedCount = (db.query(
 						`SELECT COUNT(*) AS c FROM trace_summaries WHERE active_span_count = 0`,
 					).get() as { c: number }).c
-					const traceCutCount = Math.max(1, Math.floor(completedCount * 0.2))
+					const traceCutCount = Math.max(1, Math.min(Math.floor(completedCount * 0.2), EVICT_MAX_TRACES_PER_PASS))
 					const oldest = db.query(
 						`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
 					).all(traceCutCount) as readonly { trace_id: string }[]
@@ -1062,6 +1092,9 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				// runs on its own faster cadence so the file shrinks even
 				// when no traces are evicted in a given retention tick (e.g.
 				// after a large historical eviction has already happened).
+				} catch (err) {
+					console.warn(`motel: retention pass failed (will retry in 60s): ${(err as Error).message}`)
+				}
 			})
 		})
 

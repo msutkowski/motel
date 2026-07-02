@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs"
 import path from "node:path"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { config, parsePositiveInt } from "./config.js"
 import { HttpApiBuilder, HttpApiScalar } from "effect/unstable/httpapi"
 import * as HttpMiddleware from "effect/unstable/http/HttpMiddleware"
@@ -12,6 +12,7 @@ import { MotelHttpApi } from "./httpApi.js"
 import { attributeFiltersFromEntries, attributeContainsFiltersFromEntries } from "./queryFilters.js"
 import { MOTEL_SERVICE_ID, MOTEL_VERSION, removeRegistryEntry, writeRegistryEntry } from "./registry.js"
 import { AsyncIngest, AsyncIngestLive } from "./services/AsyncIngest.js"
+import { IngestError } from "./services/ingestRpc.js"
 import { LogQueryService, LogQueryServiceLive } from "./services/LogQueryService.js"
 import { TelemetryStore, TelemetryStoreLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
 import { TraceQueryService, TraceQueryServiceLive } from "./services/TraceQueryService.js"
@@ -302,6 +303,24 @@ pre { white-space:pre-wrap; margin:0; color:#ede7da; }
 </html>`
 }
 
+// Fail-fast guard on the ingest worker round-trip. The worker RPC queue is
+// unbounded and FIFO: when the worker falls behind (SQLite degradation,
+// runaway DB growth), every OTLP POST otherwise waits in line indefinitely —
+// measured at 3+ DAYS during the retention-wedge incident — while the
+// exporter on the other end times out, abandons its socket, and opens a new
+// one on the next flush. Thousands of half-dead connections later, the
+// machine runs out of ephemeral ports. Shedding load with a 500 instead lets
+// OTLP clients complete the request cycle (drop the batch, reuse or close
+// the connection cleanly) and keeps the socket count flat. The timeout also
+// interrupts the queued RPC so abandoned work doesn't keep the worker busy.
+const INGEST_SHED_TIMEOUT = Duration.seconds(30)
+const shedIngestLoad = (method: string) =>
+	Effect.fail(
+		new IngestError({
+			message: `${method} timed out after ${Duration.toSeconds(INGEST_SHED_TIMEOUT)}s — ingest worker is backlogged; batch dropped`,
+		}),
+	)
+
 const TelemetryGroupLive = HttpApiBuilder.group(
 	MotelHttpApi,
 	"telemetry",
@@ -333,7 +352,9 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 						readOtlpBody(request, decodeTraceExportRequest),
 						(payload) =>
 							Effect.map(
-								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload: payload as never })),
+								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestTraces({ payload: payload as never })).pipe(
+									Effect.timeoutOrElse({ duration: INGEST_SHED_TIMEOUT, orElse: () => shedIngestLoad("ingestTraces") }),
+								),
 								(result) => jsonResponse(result),
 							),
 					),
@@ -345,7 +366,9 @@ const TelemetryGroupLive = HttpApiBuilder.group(
 						readOtlpBody(request, decodeLogsExportRequest),
 						(payload) =>
 							Effect.map(
-								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload: payload as never })),
+								Effect.flatMap(AsyncIngest.asEffect(), (ingest) => ingest.ingestLogs({ payload: payload as never })).pipe(
+									Effect.timeoutOrElse({ duration: INGEST_SHED_TIMEOUT, orElse: () => shedIngestLoad("ingestLogs") }),
+								),
 								(result) => jsonResponse(result),
 							),
 					),
@@ -728,5 +751,12 @@ export const ServerLive = HttpRouter.serve(
 		port: config.otel.port,
 		hostname: config.otel.host,
 		reusePort: true,
+		// Reap idle keep-alive connections. OTLP exporters that time out
+		// client-side abandon their sockets without closing them; with no
+		// idle timeout those accumulate forever (observed: 15k ESTABLISHED
+		// loopback connections → machine-wide ephemeral-port exhaustion).
+		// 120s is far above any healthy request/flush interval. Applies to
+		// HTTP connections only — websockets negotiate their own lifecycle.
+		idleTimeout: 120,
 	})),
 )
