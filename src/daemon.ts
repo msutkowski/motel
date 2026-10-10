@@ -8,6 +8,7 @@ import { isAlive, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, MOTEL_VERSI
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
 const START_TIMEOUT_MS = 30_000
 const STOP_TIMEOUT_MS = 10_000
+const KILL_TIMEOUT_MS = 5_000
 const LOCK_TIMEOUT_MS = 10_000
 const START_POLL_INTERVAL_MS = 25
 const POLL_INTERVAL_MS = 150
@@ -358,17 +359,33 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			if (errno.code !== "ESRCH") throw error
 		}
 
-		const deadline = Date.now() + STOP_TIMEOUT_MS
-		while (Date.now() < deadline) {
-			if (!isAlive(pid)) return
-			const health = await fetchHealth()
-			if (health && health.pid !== pid) return
-			const registry = readRegistryEntry()
-			if (!health && (!registry || registry.pid !== pid)) return
-			await sleep(POLL_INTERVAL_MS)
+		const waitForExit = async (timeoutMs: number) => {
+			const deadline = Date.now() + timeoutMs
+			while (Date.now() < deadline) {
+				if (!isAlive(pid)) return true
+				const health = await fetchHealth()
+				if (health && health.pid !== pid) return true
+				const registry = readRegistryEntry()
+				if (!health && (!registry || registry.pid !== pid)) return true
+				await sleep(POLL_INTERVAL_MS)
+			}
+			return false
 		}
 
-		throw new Error(`Timed out waiting for daemon ${pid} to stop.`)
+		if (await waitForExit(STOP_TIMEOUT_MS)) return
+
+		// A daemon stuck in synchronous SQLite work never sees SIGTERM.
+		// Leaving it alive keeps the DB mmap'd and the port held, so
+		// `motel reset` / `restart` could never recover; SIGKILL instead.
+		try {
+			process.kill(pid, "SIGKILL")
+		} catch (error) {
+			const errno = error as NodeJS.ErrnoException
+			if (errno.code !== "ESRCH") throw error
+		}
+		if (await waitForExit(KILL_TIMEOUT_MS)) return
+
+		throw new Error(`Timed out waiting for daemon ${pid} to stop (SIGTERM and SIGKILL sent).`)
 	}
 
 	const getStatus = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<DaemonStatus> => {
@@ -563,10 +580,9 @@ export const stopManagedDaemon = Effect.suspend(() => createDaemonManager().stop
  * daemon on a fresh file. Used by `motel reset` when the DB has grown
  * past what retention can keep up with (or just to start clean).
  *
- * Sequence: stop the daemon → delete `telemetry.sqlite` + `-wal` +
- * `-shm` → start a fresh daemon. If the stop step fails (commonly: the
- * daemon is wedged and ignoring SIGTERM), bail without deleting; the
- * user needs to SIGKILL the wedged pid manually, otherwise the surviving
+ * Sequence: stop the daemon (SIGTERM, then SIGKILL if it is wedged) →
+ * delete `telemetry.sqlite` + `-wal` + `-shm` → start a fresh daemon.
+ * If the stop step still fails, bail without deleting: the surviving
  * process has the old DB mmap'd and a fresh start would race over the
  * shared port.
  */

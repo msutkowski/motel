@@ -9,6 +9,12 @@
  * lets both connections coexist against the same `.sqlite` file: the
  * worker writes, the main thread reads, and neither blocks the other.
  *
+ * This worker is the only writer, so it also owns the retention loop
+ * (age + size-cap eviction, vacuum, checkpoint). Maintenance runs here
+ * so a multi-minute pass on a large database can never freeze the
+ * daemon's HTTP event loop, and never contends with ingest for the
+ * write lock.
+ *
  * The worker only exposes `ingestTraces` / `ingestLogs` (see
  * ingestRpc.ts). Query methods stay on the main thread because they're
  * already fast (1-14ms) and round-tripping them through structured-

@@ -271,4 +271,45 @@ describe("daemon manager", () => {
 			else process.env.XDG_STATE_HOME = originalXdg
 		}
 	})
+	test("stop escalates to SIGKILL when the daemon ignores SIGTERM", async () => {
+		// A daemon frozen in synchronous SQLite work never handles SIGTERM.
+		// `motel reset` used to give up after 10s and leave the wedged pid
+		// holding the DB and the port.
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		const registryRoot = path.join(harness.runtimeDir, "state")
+		const originalXdg = process.env.XDG_STATE_HOME
+		process.env.XDG_STATE_HOME = registryRoot
+		const registryInstancesDir = path.join(registryRoot, "motel", "instances")
+		fs.mkdirSync(registryInstancesDir, { recursive: true })
+
+		const child = Bun.spawn(["sh", "-c", "trap '' TERM; echo ready; while :; do sleep 1; done"], {
+			stdout: "pipe",
+			stderr: "ignore",
+		})
+		try {
+			// Don't signal before the trap is installed.
+			const reader = child.stdout.getReader()
+			await reader.read()
+			reader.releaseLock()
+
+			fs.writeFileSync(path.join(registryInstancesDir, `${child.pid}.json`), JSON.stringify({
+				pid: child.pid,
+				url: `http://127.0.0.1:${harness.port}`,
+				workdir: process.cwd(),
+				startedAt: new Date().toISOString(),
+				version: "0.0.0-test",
+				databasePath: harness.databasePath,
+			}), "utf8")
+
+			const status = await Effect.runPromise(harness.manager.stop)
+			expect(status.running).toBe(false)
+			await child.exited
+			expect(child.signalCode).toBe("SIGKILL")
+		} finally {
+			child.kill("SIGKILL")
+			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME
+			else process.env.XDG_STATE_HOME = originalXdg
+		}
+	}, 30_000)
 })

@@ -14,7 +14,7 @@ import { MOTEL_SERVICE_ID, MOTEL_VERSION, removeRegistryEntry, writeRegistryEntr
 import { AsyncIngest, AsyncIngestLive } from "./services/AsyncIngest.js"
 import { IngestError } from "./services/ingestRpc.js"
 import { LogQueryService, LogQueryServiceLive } from "./services/LogQueryService.js"
-import { TelemetryStore, TelemetryStoreLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
+import { TelemetryStore, TelemetryStoreDaemonLive, TelemetryStoreReadonlyLive } from "./services/TelemetryStore.js"
 import { TraceQueryService, TraceQueryServiceLive } from "./services/TraceQueryService.js"
 import type { LogItem, TraceItem, TraceSummaryItem } from "./domain.js"
 import { lifecycleLabel } from "./ui/format.js"
@@ -739,14 +739,14 @@ export const ServerLive = HttpRouter.serve(
 	// attributes off every ingest request that would have been written
 	// to the spans table as noise.
 	Layer.provide(HttpMiddleware.layerTracerDisabledForUrls(["/v1/traces", "/v1/logs"])),
-	// AsyncIngest spawns the telemetry worker — keeps the main-thread
-	// event loop free during heavy SQLite writes. Provided alongside
-	// the writer TelemetryStore for ingest / maintenance. Query endpoints
-	// resolve through readonly TraceQueryService / LogQueryService so
-	// reads do not contend with the writer connection.
+	// AsyncIngest spawns the telemetry worker, which is the sole SQLite
+	// writer and owns retention — the main-thread event loop never runs
+	// heavy SQLite work. The daemon store here does schema setup only.
+	// Query endpoints resolve through readonly TraceQueryService /
+	// LogQueryService so reads do not contend with the writer connection.
 	Layer.provideMerge(AsyncIngestLive),
 	Layer.provideMerge(QueryServicesLive),
-	Layer.provideMerge(TelemetryStoreLive),
+	Layer.provideMerge(TelemetryStoreDaemonLive),
 	Layer.provideMerge(BunHttpServer.layer({
 		port: config.otel.port,
 		hostname: config.otel.host,
