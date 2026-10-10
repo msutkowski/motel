@@ -147,7 +147,9 @@ const expectedEnv = (config: DaemonConfig) => ({
 export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager => {
 	const config = resolveConfig(options)
 	const mapError = (error: unknown) => new DaemonError(error instanceof Error ? error.message : String(error))
-	const readRegistryEntry = () => pickByWorkdir(listAliveEntries(), config.workdir)
+	// Only daemons on our URL. Several can share a workdir (another port,
+	// a test harness); `stop` kills whatever pid this returns.
+	const readRegistryEntry = () => pickByWorkdir(listAliveEntries().filter((entry) => entry.url === config.baseUrl), config.workdir)
 
 	const fetchHealth = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<HealthShape | null> => {
 		try {
@@ -245,12 +247,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	const getStatusFromRegistry = (): DaemonStatus | null => {
 		const entry = readRegistryEntry()
 		if (!entry) return null
-		// Port discriminator: a motel registry shared across several
-		// daemons (e.g., user running two instances on different
-		// ports from the same workdir, or a test harness on a random
-		// port) would otherwise have us adopt an unrelated daemon.
-		// URL match is a fast, unambiguous identity check.
-		if (entry.url !== config.baseUrl) return null
 		const mismatch = describeRegistryMismatch(entry)
 		return {
 			running: mismatch === null,

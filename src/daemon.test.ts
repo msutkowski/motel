@@ -271,6 +271,36 @@ describe("daemon manager", () => {
 			else process.env.XDG_STATE_HOME = originalXdg
 		}
 	})
+	test("stop leaves a daemon registered on another port alone", async () => {
+		const harness = makeHarness()
+		activeHarnesses.push(harness)
+		const registryRoot = path.join(harness.runtimeDir, "state")
+		const originalXdg = process.env.XDG_STATE_HOME
+		process.env.XDG_STATE_HOME = registryRoot
+		const registryInstancesDir = path.join(registryRoot, "motel", "instances")
+		fs.mkdirSync(registryInstancesDir, { recursive: true })
+
+		const other = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" })
+		try {
+			fs.writeFileSync(path.join(registryInstancesDir, `${other.pid}.json`), JSON.stringify({
+				pid: other.pid,
+				url: `http://127.0.0.1:${harness.port + 1}`,
+				workdir: process.cwd(),
+				startedAt: new Date().toISOString(),
+				version: "0.0.0-test",
+				databasePath: harness.databasePath,
+			}), "utf8")
+
+			const status = await Effect.runPromise(harness.manager.stop)
+			expect(status.pid).toBeNull()
+			expect(other.exitCode).toBeNull()
+			expect(other.signalCode).toBeNull()
+		} finally {
+			other.kill("SIGKILL")
+			if (originalXdg === undefined) delete process.env.XDG_STATE_HOME
+			else process.env.XDG_STATE_HOME = originalXdg
+		}
+	})
 	test("stop escalates to SIGKILL when the daemon ignores SIGTERM", async () => {
 		// A daemon frozen in synchronous SQLite work never handles SIGTERM.
 		// `motel reset` used to give up after 10s and leave the wedged pid
