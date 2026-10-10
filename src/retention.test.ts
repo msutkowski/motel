@@ -103,7 +103,8 @@ describe("retention pass", () => {
 		expect(count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id = 'old-trace'`)).toBe(0)
 		expect(count(`SELECT COUNT(*) c FROM spans WHERE trace_id = 'old-trace'`)).toBe(0)
 		expect(count(`SELECT COUNT(*) c FROM span_attributes WHERE trace_id = 'old-trace'`)).toBe(0)
-		expect(count(`SELECT COUNT(*) c FROM span_operation_fts WHERE trace_id = 'old-trace'`)).toBe(0)
+		// Both traces share operation names; only the fresh trace's two spans stay indexed.
+		expect(count(`SELECT COUNT(*) c FROM span_operation_fts WHERE span_operation_fts MATCH 'op'`)).toBe(2)
 		expect(count(`SELECT COUNT(*) c FROM logs WHERE trace_id = 'old-trace'`)).toBe(0)
 		expect(count(`SELECT COUNT(*) c FROM logs WHERE body = 'old orphan'`)).toBe(0)
 		// Nothing left dangling off deleted logs.
@@ -134,6 +135,8 @@ describe("retention pass", () => {
 
 		const after = count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id LIKE 'big-%'`)
 		expect(after).toBeLessThan(before)
+		// One pass gets all the way under the cap.
+		expect((await run((store) => store.databaseStats)).effectiveBytes).toBeLessThanOrEqual(1024 * 1024)
 		// Oldest goes first; the newest survives.
 		expect(count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id = 'big-0'`)).toBe(0)
 		expect(count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id = 'big-${ingested - 1}'`)).toBe(1)
