@@ -2,13 +2,13 @@ import * as fs from "node:fs"
 import { promises as fsp } from "node:fs"
 import * as path from "node:path"
 import { Effect } from "effect"
+import { config } from "./config.js"
 import { isAlive, listAliveEntries, motelStateDir, MOTEL_SERVICE_ID, MOTEL_VERSION, type RegistryEntry } from "./registry.js"
 
 const DEFAULT_REPO_ROOT = path.resolve(import.meta.dir, "..")
-const DEFAULT_HOST = "127.0.0.1"
-const DEFAULT_PORT = 27686
 const START_TIMEOUT_MS = 30_000
 const STOP_TIMEOUT_MS = 10_000
+const KILL_TIMEOUT_MS = 5_000
 const LOCK_TIMEOUT_MS = 10_000
 const START_POLL_INTERVAL_MS = 25
 const POLL_INTERVAL_MS = 150
@@ -102,8 +102,8 @@ const resolveConfig = (options: DaemonOptions = {}): DaemonConfig => {
 	const workdir = path.resolve(options.workdir ?? process.cwd())
 	const runtimeDir = path.resolve(options.runtimeDir ?? motelStateDir())
 	const databasePath = path.resolve(options.databasePath ?? path.join(runtimeDir, "telemetry.sqlite"))
-	const host = options.host ?? DEFAULT_HOST
-	const port = options.port ?? DEFAULT_PORT
+	const host = options.host ?? config.otel.host
+	const port = options.port ?? config.otel.port
 	return {
 		repoRoot,
 		serverEntry: path.join(repoRoot, "src/server.ts"),
@@ -147,7 +147,9 @@ const expectedEnv = (config: DaemonConfig) => ({
 export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager => {
 	const config = resolveConfig(options)
 	const mapError = (error: unknown) => new DaemonError(error instanceof Error ? error.message : String(error))
-	const readRegistryEntry = () => pickByWorkdir(listAliveEntries(), config.workdir)
+	// Only daemons on our URL. Several can share a workdir (another port,
+	// a test harness); `stop` kills whatever pid this returns.
+	const readRegistryEntry = () => pickByWorkdir(listAliveEntries().filter((entry) => entry.url === config.baseUrl), config.workdir)
 
 	const fetchHealth = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<HealthShape | null> => {
 		try {
@@ -245,12 +247,6 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 	const getStatusFromRegistry = (): DaemonStatus | null => {
 		const entry = readRegistryEntry()
 		if (!entry) return null
-		// Port discriminator: a motel registry shared across several
-		// daemons (e.g., user running two instances on different
-		// ports from the same workdir, or a test harness on a random
-		// port) would otherwise have us adopt an unrelated daemon.
-		// URL match is a fast, unambiguous identity check.
-		if (entry.url !== config.baseUrl) return null
 		const mismatch = describeRegistryMismatch(entry)
 		return {
 			running: mismatch === null,
@@ -359,17 +355,33 @@ export const createDaemonManager = (options: DaemonOptions = {}): DaemonManager 
 			if (errno.code !== "ESRCH") throw error
 		}
 
-		const deadline = Date.now() + STOP_TIMEOUT_MS
-		while (Date.now() < deadline) {
-			if (!isAlive(pid)) return
-			const health = await fetchHealth()
-			if (health && health.pid !== pid) return
-			const registry = readRegistryEntry()
-			if (!health && (!registry || registry.pid !== pid)) return
-			await sleep(POLL_INTERVAL_MS)
+		const waitForExit = async (timeoutMs: number) => {
+			const deadline = Date.now() + timeoutMs
+			while (Date.now() < deadline) {
+				if (!isAlive(pid)) return true
+				const health = await fetchHealth()
+				if (health && health.pid !== pid) return true
+				const registry = readRegistryEntry()
+				if (!health && (!registry || registry.pid !== pid)) return true
+				await sleep(POLL_INTERVAL_MS)
+			}
+			return false
 		}
 
-		throw new Error(`Timed out waiting for daemon ${pid} to stop.`)
+		if (await waitForExit(STOP_TIMEOUT_MS)) return
+
+		// A daemon stuck in synchronous SQLite work never sees SIGTERM.
+		// Leaving it alive keeps the DB mmap'd and the port held, so
+		// `motel reset` / `restart` could never recover; SIGKILL instead.
+		try {
+			process.kill(pid, "SIGKILL")
+		} catch (error) {
+			const errno = error as NodeJS.ErrnoException
+			if (errno.code !== "ESRCH") throw error
+		}
+		if (await waitForExit(KILL_TIMEOUT_MS)) return
+
+		throw new Error(`Timed out waiting for daemon ${pid} to stop (SIGTERM and SIGKILL sent).`)
 	}
 
 	const getStatus = async (timeoutMs: number = HEALTH_FAST_TIMEOUT_MS): Promise<DaemonStatus> => {
@@ -558,3 +570,29 @@ export const applyManagedDaemonEnv = Effect.suspend(() => createDaemonManager().
 export const getManagedDaemonStatus = Effect.suspend(() => createDaemonManager().getStatus)
 export const ensureManagedDaemon = Effect.suspend(() => createDaemonManager().ensure)
 export const stopManagedDaemon = Effect.suspend(() => createDaemonManager().stop)
+
+/**
+ * Wipe the local telemetry SQLite database and restart the managed
+ * daemon on a fresh file. Used by `motel reset` when the DB has grown
+ * past what retention can keep up with (or just to start clean).
+ *
+ * Sequence: stop the daemon (SIGTERM, then SIGKILL if it is wedged) →
+ * delete `telemetry.sqlite` + `-wal` + `-shm` → start a fresh daemon.
+ * If the stop step still fails, bail without deleting: the surviving
+ * process has the old DB mmap'd and a fresh start would race over the
+ * shared port.
+ */
+export const resetManagedDaemon = Effect.gen(function* () {
+	const manager = createDaemonManager()
+	const config = resolveConfig()
+	yield* manager.stop
+	yield* Effect.sync(() => {
+		for (const suffix of ["", "-wal", "-shm"]) {
+			try { fs.unlinkSync(`${config.databasePath}${suffix}`) } catch (error) {
+				const errno = error as NodeJS.ErrnoException
+				if (errno.code !== "ENOENT") throw error
+			}
+		}
+	})
+	return yield* manager.ensure
+})

@@ -95,3 +95,56 @@ export const removeRegistryEntry = (pid: number) => {
 		// was never written.
 	}
 }
+
+/**
+ * Pick the live registry entry whose workdir is the deepest match for
+ * `targetWorkdir` (prefix-matched on path separators). Mirrors
+ * `pickByWorkdir` in `./daemon.ts` but lives here so it can be used by
+ * code paths that must run before `./config.ts` is evaluated.
+ */
+export const pickRegistryEntryForWorkdir = (targetWorkdir: string): RegistryEntry | null => {
+	const withSep = targetWorkdir.endsWith(path.sep) ? targetWorkdir : `${targetWorkdir}${path.sep}`
+	return listAliveEntries()
+		.filter((entry) => {
+			const workdir = entry.workdir.endsWith(path.sep) ? entry.workdir : `${entry.workdir}${path.sep}`
+			return withSep === workdir || withSep.startsWith(workdir)
+		})
+		.sort((a, b) => b.workdir.length - a.workdir.length)[0] ?? null
+}
+
+/**
+ * Adopt the URL of an already-running daemon for the current workdir by
+ * populating `MOTEL_OTEL_*` env vars before `./config.ts` is evaluated.
+ *
+ * Without this, the TUI process and the daemon process can disagree on
+ * which port motel is serving on. The TUI reads SQLite directly so it
+ * still sees data, but URL-producing commands like `o`/`O` (open in
+ * browser) and `c` (copy OTLP setup instructions) emit URLs pointing at
+ * the default port — a port nothing is listening on if the user started
+ * the daemon on a non-default port.
+ *
+ * Only fills variables the caller hasn't already set. An explicit
+ * `MOTEL_OTEL_BASE_URL` (or `MOTEL_OTEL_PORT`) on the command line
+ * always wins.
+ */
+export const adoptRunningDaemonEnv = (): void => {
+	if (process.env.MOTEL_OTEL_BASE_URL?.trim()) return
+	if (process.env.MOTEL_OTEL_QUERY_URL?.trim()) return
+	if (process.env.MOTEL_OTEL_PORT?.trim()) return
+	const entry = pickRegistryEntryForWorkdir(process.cwd())
+	if (!entry) return
+	try {
+		const parsed = new URL(entry.url)
+		// Adopt the registry URL only if it carries an explicit port. A
+		// portless URL would force us to guess (80 for http, 443 for
+		// https) and almost certainly point at a port nothing is
+		// listening on — worse than letting config.ts use its defaults.
+		if (!parsed.port) return
+		process.env.MOTEL_OTEL_BASE_URL = entry.url
+		if (!process.env.MOTEL_OTEL_HOST?.trim()) process.env.MOTEL_OTEL_HOST = parsed.hostname
+		process.env.MOTEL_OTEL_PORT = parsed.port
+	} catch {
+		// Registry entry has a malformed URL — leave env alone and let
+		// config.ts resolve from its usual defaults.
+	}
+}

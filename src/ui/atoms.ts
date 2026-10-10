@@ -1,6 +1,7 @@
 import * as Atom from "effect/unstable/reactivity/Atom"
 import { config } from "../config.ts"
 import type { LogItem, TraceItem, TraceSummaryItem } from "../domain.ts"
+import type { DatabaseStats } from "../services/TelemetryStore.ts"
 import type { ThemeName } from "./theme.ts"
 import { readLastService, readLastTheme } from "./persistence.ts"
 
@@ -129,3 +130,5 @@ export const selectedThemeAtom = Atom.make<ThemeName>(readLastTheme()).pipe(Atom
 export type TraceSortMode = "recent" | "slowest" | "errors"
 export const traceSortAtom = Atom.make<TraceSortMode>("recent").pipe(Atom.keepAlive)
 export const collapsedSpanIdsAtom = Atom.make(new Set<string>() as ReadonlySet<string>).pipe(Atom.keepAlive)
+
+export const dbStatsAtom = Atom.make<DatabaseStats | null>(null).pipe(Atom.keepAlive)

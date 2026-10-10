@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite"
-import { mkdirSync } from "node:fs"
+import { mkdirSync, statSync } from "node:fs"
 import { dirname } from "node:path"
-import { Clock, Effect, Layer, Schedule, Context } from "effect"
+import { Clock, Context, Duration, Effect, Exit, Layer, Schedule, Scope, Semaphore } from "effect"
 import { config } from "../config.js"
 import type { AiCallDetail, AiCallSummary, FacetItem, LogItem, SpanItem, StatsItem, TraceItem, TraceSummaryItem, TraceSpanEvent, TraceSpanItem } from "../domain.js"
 import { AI_ATTR_MAP, AI_FTS_KEYS, AI_TEXT_SEARCH_KEYS, truncatePreview } from "../domain.js"
@@ -446,9 +446,115 @@ export class TelemetryStore extends Context.Service<
 		readonly searchAiCalls: (input: AiCallSearch) => Effect.Effect<readonly AiCallSummary[], Error>
 		readonly getAiCall: (spanId: string) => Effect.Effect<AiCallDetail | null, Error>
 		readonly aiCallStats: (input: AiCallStatsSearch) => Effect.Effect<readonly StatsItem[], Error>
+		readonly databaseStats: Effect.Effect<DatabaseStats, Error>
+		/** One age + size-cap eviction pass. Never fails; the loop calls this every 60s. */
+		readonly runRetentionPass: Effect.Effect<void>
 	}
 >()("motel/TelemetryStore") {}
 
+/**
+ * Summary of on-disk + in-DB storage state. Used by the TUI footer and
+ * the `/api/db-stats` endpoint. All sizes are bytes, all timestamps are
+ * milliseconds since epoch. `effectiveBytes` excludes freelist pages so
+ * a partially-vacuumed DB reports the size of actual data, not headroom.
+ */
+export interface DatabaseStats {
+	readonly databasePath: string
+	readonly fileBytes: number
+	readonly walBytes: number
+	readonly pageCount: number
+	readonly freelistPages: number
+	readonly pageSizeBytes: number
+	readonly effectiveBytes: number
+	readonly traceCount: number
+	readonly spanCount: number
+	readonly logCount: number
+	readonly oldestTraceStartedAtMs: number | null
+	readonly retentionHours: number
+	readonly maxDbSizeMb: number
+}
+
+interface SearchIndex {
+	readonly table: string
+	readonly content: string
+	readonly ddl: string
+}
+
+/**
+ * Operation-name and log-body search: external-content FTS5 keyed by the
+ * source row's rowid, kept in sync by triggers. Never write these tables
+ * directly — a 'delete' whose values don't match what was indexed corrupts
+ * an external-content index.
+ */
+const SEARCH_INDEXES: ReadonlyArray<SearchIndex> = [
+	{
+		table: "span_operation_fts",
+		content: "spans",
+		ddl: `
+			CREATE VIRTUAL TABLE IF NOT EXISTS span_operation_fts USING fts5(
+				operation_name,
+				content='spans',
+				content_rowid='rowid',
+				tokenize='unicode61'
+			);
+			CREATE TRIGGER IF NOT EXISTS span_operation_fts_ai AFTER INSERT ON spans BEGIN
+				INSERT INTO span_operation_fts(rowid, operation_name) VALUES (new.rowid, new.operation_name);
+			END;
+			CREATE TRIGGER IF NOT EXISTS span_operation_fts_ad AFTER DELETE ON spans BEGIN
+				INSERT INTO span_operation_fts(span_operation_fts, rowid, operation_name) VALUES ('delete', old.rowid, old.operation_name);
+			END;
+			CREATE TRIGGER IF NOT EXISTS span_operation_fts_au AFTER UPDATE OF operation_name ON spans
+			WHEN old.operation_name IS NOT new.operation_name BEGIN
+				INSERT INTO span_operation_fts(span_operation_fts, rowid, operation_name) VALUES ('delete', old.rowid, old.operation_name);
+				INSERT INTO span_operation_fts(rowid, operation_name) VALUES (new.rowid, new.operation_name);
+			END;
+		`,
+	},
+	{
+		table: "log_body_fts",
+		content: "logs",
+		ddl: `
+			CREATE VIRTUAL TABLE IF NOT EXISTS log_body_fts USING fts5(
+				body,
+				content='logs',
+				content_rowid='id',
+				tokenize='unicode61'
+			);
+			CREATE TRIGGER IF NOT EXISTS log_body_fts_ai AFTER INSERT ON logs BEGIN
+				INSERT INTO log_body_fts(rowid, body) VALUES (new.id, new.body);
+			END;
+			CREATE TRIGGER IF NOT EXISTS log_body_fts_ad AFTER DELETE ON logs BEGIN
+				INSERT INTO log_body_fts(log_body_fts, rowid, body) VALUES ('delete', old.id, old.body);
+			END;
+			CREATE TRIGGER IF NOT EXISTS log_body_fts_au AFTER UPDATE OF body ON logs
+			WHEN old.body IS NOT new.body BEGIN
+				INSERT INTO log_body_fts(log_body_fts, rowid, body) VALUES ('delete', old.id, old.body);
+				INSERT INTO log_body_fts(rowid, body) VALUES (new.id, new.body);
+			END;
+		`,
+	},
+]
+
+/**
+ * `legacy` is the pre-rowid layout, which names rows only in UNINDEXED
+ * columns: every delete against it scans the whole index.
+ */
+const searchIndexLayout = (db: Database, index: SearchIndex): "missing" | "legacy" | "rowid" => {
+	const row = db.query(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`).get(index.table) as { sql: string | null } | null
+	if (row === null) return "missing"
+	return row.sql?.includes(`content='${index.content}'`) ? "rowid" : "legacy"
+}
+
+/** One-time rebuild from the content table (~0.6 s per million rows), holding the write lock throughout. */
+const migrateSearchIndex = (db: Database, index: SearchIndex) => {
+	console.warn(`motel: rebuilding ${index.table} from ${index.content} (one-time migration)`)
+	db.transaction(() => {
+		if (searchIndexLayout(db, index) !== "legacy") return
+		db.exec(`DROP TABLE ${index.table}`)
+		db.exec(index.ddl)
+		db.exec(`INSERT INTO ${index.table}(${index.table}) VALUES ('rebuild')`)
+	}).immediate()
+}
 
 /**
  * How this TelemetryStore instance behaves:
@@ -461,9 +567,9 @@ export class TelemetryStore extends Context.Service<
  *   runtime errors — but readers don't call them.
  *
  * - `runRetention` — fork the background cleanup loop (age + size cap
- *   eviction, WAL checkpoint). Only one process should own this at a
- *   time. Currently the main daemon (localServer) does; the ingest
- *   worker and the TUI skip it.
+ *   eviction, WAL checkpoint). Only one writer per database may own
+ *   this, and never a thread that serves HTTP: in the daemon it is the
+ *   ingest worker; the daemon's main thread and the TUI skip it.
  */
 export interface TelemetryStoreOptions {
 	readonly readonly: boolean
@@ -599,6 +705,8 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					CREATE INDEX IF NOT EXISTS idx_trace_summaries_started_at ON trace_summaries(started_at_ms DESC, trace_id DESC);
 					CREATE INDEX IF NOT EXISTS idx_trace_summaries_service_started_at ON trace_summaries(service_name, started_at_ms DESC, trace_id DESC);
 					CREATE INDEX IF NOT EXISTS idx_trace_summaries_duration ON trace_summaries(duration_ms DESC);
+					-- Retention's age query; without it every pass is a full scan + sort.
+					CREATE INDEX IF NOT EXISTS idx_trace_summaries_completed_ended_at ON trace_summaries(ended_at_ms) WHERE active_span_count = 0;
 
 					CREATE TABLE IF NOT EXISTS span_attributes (
 						trace_id TEXT NOT NULL,
@@ -635,34 +743,37 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		let hasAttrFts = true
 		if (opts.readonly) {
 			try {
-				const row = db.query(`SELECT name FROM sqlite_master WHERE type='table' AND name='span_operation_fts'`).get()
-				hasFts = row !== null
-			} catch { hasFts = false }
-			try {
 				const row = db.query(`SELECT name FROM sqlite_master WHERE type='table' AND name='span_attr_fts'`).get()
 				hasAttrFts = row !== null
 			} catch { hasAttrFts = false }
 		}
 
-		if (!opts.readonly) {
-		try {
-			db.exec(`
-				CREATE VIRTUAL TABLE IF NOT EXISTS span_operation_fts USING fts5(
-					trace_id UNINDEXED,
-					span_id UNINDEXED,
-					operation_name,
-					tokenize='unicode61'
-				);
+		// Search SQL assumes the rowid layout. Re-probe until it lands: the
+		// ingest worker may migrate a legacy database after this connection
+		// opened. Until then search falls back to LIKE.
+		let searchIndexesReady = false
+		const searchReady = () => {
+			if (!searchIndexesReady) {
+				try {
+					searchIndexesReady = SEARCH_INDEXES.every((index) => searchIndexLayout(db, index) === "rowid")
+				} catch { /* stay on LIKE */ }
+			}
+			return searchIndexesReady
+		}
 
-				CREATE VIRTUAL TABLE IF NOT EXISTS log_body_fts USING fts5(
-					log_id UNINDEXED,
-					body,
-					tokenize='unicode61'
-				);
-			`)
-		} catch {
-			hasFts = false
-			// FTS is optional; queries will fall back to LIKE if unavailable.
+		if (!opts.readonly) {
+		for (const index of SEARCH_INDEXES) {
+			try {
+				const layout = searchIndexLayout(db, index)
+				if (layout !== "legacy") db.exec(index.ddl)
+				// Only the retention owner migrates, so two writers never race
+				// the one-time rebuild.
+				else if (opts.runRetention) migrateSearchIndex(db, index)
+			} catch (err) {
+				hasFts = false
+				// FTS is optional; queries will fall back to LIKE if unavailable.
+				console.warn(`motel: ${index.table} setup skipped: ${(err as Error).message}`)
+			}
 		}
 
 		// External-content FTS5 over the subset of span_attributes.value rows
@@ -803,8 +914,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 		const reconcileTraceSummaries = Effect.sync(() => {
 			try {
-				db.query(`DELETE FROM trace_summaries`).run()
-				rebuildTraceSummaries.run()
+				// One transaction, so readers never see the table empty mid-rebuild.
+				db.transaction(() => {
+					db.query(`DELETE FROM trace_summaries`).run()
+					rebuildTraceSummaries.run()
+				}).immediate()
 			} catch (err) {
 				if (!isSqliteLockError(err)) throw err
 				console.warn(`motel: trace summary rebuild skipped during startup: ${(err as Error).message}`)
@@ -829,33 +943,6 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			}
 			query.run(...entries.flatMap(([key, value]) => [traceId, spanId, key, value]))
 		}
-		const deleteSpanOperationSearch = db.query(`DELETE FROM span_operation_fts WHERE trace_id = ? AND span_id = ?`)
-		const insertSpanOperationSearch = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES (?, ?, ?)`)
-		const deleteSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const insertSpanOperationSearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const updateSpanOperationSearchMany = (operations: ReadonlyArray<readonly [string, string, string]>) => {
-			if (operations.length === 0) return
-			if (operations.length === 1) {
-				const [traceId, spanId, operationName] = operations[0]!
-				deleteSpanOperationSearch.run(traceId, spanId)
-				insertSpanOperationSearch.run(traceId, spanId, operationName)
-				return
-			}
-
-			let deleteQuery = deleteSpanOperationSearchManyByCount.get(operations.length)
-			if (!deleteQuery) {
-				deleteQuery = db.query(`DELETE FROM span_operation_fts WHERE ${operations.map(() => "(trace_id = ? AND span_id = ?)").join(" OR ")}`)
-				deleteSpanOperationSearchManyByCount.set(operations.length, deleteQuery)
-			}
-			deleteQuery.run(...operations.flatMap(([traceId, spanId]) => [traceId, spanId]))
-
-			let insertQuery = insertSpanOperationSearchManyByCount.get(operations.length)
-			if (!insertQuery) {
-				insertQuery = db.query(`INSERT INTO span_operation_fts (trace_id, span_id, operation_name) VALUES ${operations.map(() => "(?, ?, ?)").join(", ")}`)
-				insertSpanOperationSearchManyByCount.set(operations.length, insertQuery)
-			}
-			insertQuery.run(...operations.flatMap(([traceId, spanId, operationName]) => [traceId, spanId, operationName]))
-		}
 		const insertLogAttribute = db.query(`INSERT INTO log_attributes (log_id, key, value) VALUES (?, ?, ?)`)
 		const logAttributeInsertManyByCount = new Map<number, ReturnType<Database["query"]>>()
 		const insertLogAttributesMany = (logId: number, attributes: Readonly<Record<string, string>>) => {
@@ -873,22 +960,6 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			}
 			query.run(...entries.flatMap(([key, value]) => [logId, key, value]))
 		}
-		const insertLogBodySearch = db.query(`INSERT INTO log_body_fts (log_id, body) VALUES (?, ?)`)
-		const insertLogBodySearchManyByCount = new Map<number, ReturnType<Database["query"]>>()
-		const insertLogBodySearchMany = (entries: ReadonlyArray<readonly [string, string]>) => {
-			if (entries.length === 0) return
-			if (entries.length === 1) {
-				const [logId, body] = entries[0]!
-				insertLogBodySearch.run(logId, body)
-				return
-			}
-			let query = insertLogBodySearchManyByCount.get(entries.length)
-			if (!query) {
-				query = db.query(`INSERT INTO log_body_fts (log_id, body) VALUES ${entries.map(() => "(?, ?)").join(", ")}`)
-				insertLogBodySearchManyByCount.set(entries.length, query)
-			}
-			query.run(...entries.flatMap(([logId, body]) => [logId, body]))
-		}
 
 		const maxDbSizeBytes = config.otel.maxDbSizeMb * 1024 * 1024
 
@@ -902,6 +973,18 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		const VACUUM_PAGES_NORMAL = 2000     // ~8MB/pass
 		const VACUUM_PAGES_BUSY = 20000      // ~80MB/pass — used when freelist > 20%
 		const VACUUM_PAGES_PANIC = 50000     // ~200MB/pass — only when ratio > 50%
+
+		// Age-expired traces evicted per pass; a backlog drains over
+		// successive 60s passes.
+		const EVICT_MAX_TRACES_PER_PASS = 5000
+		// Size-cap batches per pass (× EVICT_BATCH_SIZE traces). Must outpace
+		// sustained ingest, observed at ~3k traces/min.
+		const EVICT_MAX_SIZE_BATCHES_PER_PASS = 200
+		// Size eviction starts above 95% of the cap and runs down to 90%. The
+		// gap must absorb one 60s pass of ingest (~28 MB observed) or live
+		// data overshoots the cap between passes.
+		const SIZE_EVICT_START_BYTES = maxDbSizeBytes * 0.95
+		const SIZE_EVICT_STOP_BYTES = maxDbSizeBytes * 0.9
 
 		const ftsTableNames = ["span_attr_fts", "log_body_fts", "span_operation_fts"] as const
 
@@ -919,6 +1002,13 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 		const reclaimSpace = Effect.fn("motel/TelemetryStore.reclaimSpace")(function* () {
 			yield* Effect.sync(() => {
+				// This pass runs under Effect.repeat, which STOPS repeating the
+				// moment the effect fails. A single uncaught SQLITE_BUSY (routine
+				// when the ingest worker holds the write lock past busy_timeout)
+				// would therefore kill page reclamation for the life of the
+				// process — silently. Never let an error escape a maintenance
+				// pass; log and let the next tick retry.
+				try {
 				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
 				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
 				if (pageCount === 0) return
@@ -944,107 +1034,147 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				// has grown.
 				const mode = ratio >= FREELIST_HIGH_RATIO ? "TRUNCATE" : "RESTART"
 				try { db.exec(`PRAGMA wal_checkpoint(${mode});`) } catch { /* ignore */ }
+				} catch (err) {
+					console.warn(`motel: reclaimSpace pass failed (will retry next tick): ${(err as Error).message}`)
+				}
 			})
 		})
 
+		// Orphan logs (no trace_id) evicted per pass. Bounded like traces so a
+		// pass never scans an unbounded backlog in one synchronous step.
+		const EVICT_MAX_ORPHAN_LOGS_PER_PASS = 20_000
+		const EVICT_BATCH_SIZE = 500
+		// Real timer between batches: the pass runs on the ingest worker's
+		// thread, and only a macrotask turn lets queued ingest RPCs run.
+		const EVICT_BATCH_PAUSE = Duration.millis(5)
+
+		const chunks = <T>(items: readonly T[], size: number): T[][] => {
+			const out: T[][] = []
+			for (let offset = 0; offset < items.length; offset += size) out.push(items.slice(offset, offset + size))
+			return out
+		}
+
+		// log_attributes hangs off logs.id; deleting by id list keeps each
+		// batch bounded. log_body_fts follows the logs delete trigger.
+		const deleteLogRows = (logIds: readonly number[]) => {
+			for (const batch of chunks(logIds, EVICT_BATCH_SIZE)) {
+				const placeholders = batch.map(() => "?").join(",")
+				db.query(`DELETE FROM log_attributes WHERE log_id IN (${placeholders})`).run(...batch)
+			}
+		}
+
+		// Wipes every row reachable from a batch of trace_ids. Batches stay
+		// under SQLite's default IN-placeholder limit (~999).
+		const evictTraceBatch = (batch: readonly string[]) => {
+			const placeholders = batch.map(() => "?").join(",")
+			const logIds = (db.query(`SELECT id FROM logs WHERE trace_id IN (${placeholders})`).all(...batch) as readonly { id: number }[]).map((row) => row.id)
+			db.query(`DELETE FROM span_attributes WHERE trace_id IN (${placeholders})`).run(...batch)
+			db.query(`DELETE FROM spans WHERE trace_id IN (${placeholders})`).run(...batch)
+			db.query(`DELETE FROM logs WHERE trace_id IN (${placeholders})`).run(...batch)
+			db.query(`DELETE FROM trace_summaries WHERE trace_id IN (${placeholders})`).run(...batch)
+			deleteLogRows(logIds)
+		}
+
+		const evictOrphanLogs = (cutoff: number) => {
+			const logIds = (db.query(
+				`SELECT id FROM logs WHERE trace_id IS NULL AND timestamp_ms < ? ORDER BY timestamp_ms ASC LIMIT ${EVICT_MAX_ORPHAN_LOGS_PER_PASS}`,
+			).all(cutoff) as readonly { id: number }[]).map((row) => row.id)
+			for (const batch of chunks(logIds, EVICT_BATCH_SIZE)) {
+				const placeholders = batch.map(() => "?").join(",")
+				db.query(`DELETE FROM logs WHERE id IN (${placeholders})`).run(...batch)
+			}
+			deleteLogRows(logIds)
+		}
+
+		// Eviction is per trace so a trace is never left half-gutted; running
+		// traces (active_span_count > 0) are never in scope.
+		const selectExpiredTraces = (cutoff: number): string[] =>
+			(db.query(
+				`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ? ORDER BY ended_at_ms ASC LIMIT ${EVICT_MAX_TRACES_PER_PASS}`,
+			).all(cutoff) as readonly { trace_id: string }[]).map((row) => row.trace_id)
+
+		const selectOldestTraces = (limit: number): string[] =>
+			(db.query(
+				`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
+			).all(limit) as readonly { trace_id: string }[]).map((row) => row.trace_id)
+
+		// Excludes freelist pages, so a large freelist can't trigger a
+		// deletion death spiral. The WAL is not counted: its pages land in
+		// the main file at checkpoint.
+		const liveBytes = () => {
+			const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
+			const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
+			const pageSize = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
+			return (pageCount - freePages) * pageSize
+		}
+
+		// One retention pass. Each SQLite step is its own synchronous block
+		// with a timer between them so ingest RPCs interleave; a failing
+		// step (SQLITE_BUSY is routine) logs and ends the pass. Nothing here
+		// may throw: Effect.repeat stops on the first failure and this loop
+		// is what stands between the database and unbounded growth.
 		const cleanupExpired = Effect.fn("motel/TelemetryStore.cleanupExpired")(function* () {
 			const now = yield* Clock.currentTimeMillis
+			const cutoff = now - config.otel.retentionHours * 60 * 60 * 1000
 
-			yield* Effect.sync(() => {
-				const cutoff = now - config.otel.retentionHours * 60 * 60 * 1000
-
-				// Evict at TRACE granularity so we never leave a trace half-gutted
-				// (previous logic deleted oldest 20% of spans, which happily sliced
-				// across traces and corrupted the summary rebuild). Running traces
-				// are protected — only `active_span_count = 0` summaries are in
-				// scope for eviction.
-				const toEvict = new Set<string>()
-
-				// Time-based: completed traces whose last span ended before cutoff.
-				const timeExpired = db.query(
-					`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 AND ended_at_ms > 0 AND ended_at_ms < ?`,
-				).all(cutoff) as readonly { trace_id: string }[]
-				for (const row of timeExpired) toEvict.add(row.trace_id)
-
-				// Size-based: if actual data exceeds cap, drop oldest 20% of the
-				// remaining completed traces. `(page_count - freelist_count)`
-				// ignores freed-but-not-vacuumed pages so a large freelist doesn't
-				// trigger a deletion death spiral.
-				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
-				const freePages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
-				const pageSize = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
-				const dbSize = (pageCount - freePages) * pageSize
-				if (dbSize > maxDbSizeBytes) {
-					const completedCount = (db.query(
-						`SELECT COUNT(*) AS c FROM trace_summaries WHERE active_span_count = 0`,
-					).get() as { c: number }).c
-					const traceCutCount = Math.max(1, Math.floor(completedCount * 0.2))
-					const oldest = db.query(
-						`SELECT trace_id FROM trace_summaries WHERE active_span_count = 0 ORDER BY started_at_ms ASC LIMIT ?`,
-					).all(traceCutCount) as readonly { trace_id: string }[]
-					// Set.add dedupes overlap with the time-expired batch above.
-					for (const row of oldest) toEvict.add(row.trace_id)
-				}
-
-				// Always prune orphan logs (no trace_id) by timestamp — they're
-				// not covered by trace eviction.
-				db.query(`DELETE FROM logs WHERE trace_id IS NULL AND timestamp_ms < ?`).run(cutoff)
-
-				if (toEvict.size === 0) return
-
-				// Batch the trace-id list so the IN placeholders stay under
-				// SQLite's default limit (~999). Each batch wipes every row
-				// reachable from those trace_ids across the cascade tables.
-				const traceIds = Array.from(toEvict)
-				const BATCH_SIZE = 500
-				for (let offset = 0; offset < traceIds.length; offset += BATCH_SIZE) {
-					const batch = traceIds.slice(offset, offset + BATCH_SIZE)
-					const placeholders = batch.map(() => "?").join(",")
-					db.query(`DELETE FROM span_attributes WHERE trace_id IN (${placeholders})`).run(...batch)
+			const step = <A>(label: string, f: () => A): Effect.Effect<A | undefined> =>
+				Effect.sync(() => {
 					try {
-						db.query(`DELETE FROM span_operation_fts WHERE trace_id IN (${placeholders})`).run(...batch)
-					} catch {
-						// FTS table may not exist on old DBs.
+						return f()
+					} catch (err) {
+						console.warn(`motel: retention ${label} failed (will retry in 60s): ${(err as Error).message}`)
+						return undefined
 					}
-					db.query(`DELETE FROM spans WHERE trace_id IN (${placeholders})`).run(...batch)
-					db.query(`DELETE FROM logs WHERE trace_id IN (${placeholders})`).run(...batch)
-					db.query(`DELETE FROM trace_summaries WHERE trace_id IN (${placeholders})`).run(...batch)
-				}
+				})
 
-				// Log-side orphans (log_attributes + FTS) are keyed by log.id,
-				// so prune what no longer has a parent log row.
-				db.query(`DELETE FROM log_attributes WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = log_attributes.log_id)`).run()
-				try {
-					db.query(`DELETE FROM log_body_fts WHERE NOT EXISTS (SELECT 1 FROM logs WHERE logs.id = CAST(log_body_fts.log_id AS INTEGER))`).run()
-				} catch {
-					// FTS table may not exist on old DBs.
-				}
+			const expired = yield* step("select", () => {
+				evictOrphanLogs(cutoff)
+				return selectExpiredTraces(cutoff)
+			})
+			if (expired === undefined) return
 
-				// Checkpoint after a big delete pass so the freed pages land
-				// in the main DB file and become eligible for incremental
-				// vacuum. Use RESTART (not PASSIVE): PASSIVE silently no-ops
-				// when readers are active, which is the documented mechanism
-				// behind WAL/freelist starvation when ingest is busy.
+			let evicted = 0
+			for (const batch of chunks(expired, EVICT_BATCH_SIZE)) {
+				const ok = yield* step("evict", () => { evictTraceBatch(batch); return true })
+				if (!ok) return
+				evicted += batch.length
+				yield* Effect.sleep(EVICT_BATCH_PAUSE)
+			}
+
+			// Size cap: oldest completed traces go first. Batches are sized from
+			// the average trace footprint so a small overage doesn't take a
+			// whole batch with it; bytesPerTrace is set once eviction starts.
+			let bytesPerTrace: number | undefined
+			for (let i = 0; i < EVICT_MAX_SIZE_BATCHES_PER_PASS; i++) {
+				const batch = yield* step("size", () => {
+					const live = liveBytes()
+					if (live <= (bytesPerTrace === undefined ? SIZE_EVICT_START_BYTES : SIZE_EVICT_STOP_BYTES)) return []
+					bytesPerTrace ??= live / Math.max(1, (db.query(`SELECT COUNT(*) AS c FROM trace_summaries`).get() as { c: number }).c)
+					return selectOldestTraces(Math.min(EVICT_BATCH_SIZE, Math.ceil((live - SIZE_EVICT_STOP_BYTES) / bytesPerTrace)))
+				})
+				if (batch === undefined || batch.length === 0) break
+				const ok = yield* step("evict", () => { evictTraceBatch(batch); return true })
+				if (!ok) return
+				evicted += batch.length
+				yield* Effect.sleep(EVICT_BATCH_PAUSE)
+			}
+			if (evicted === 0) return
+
+			yield* step("checkpoint", () => {
+				// Land freed pages in the main file so incremental vacuum can
+				// reclaim them. RESTART, not PASSIVE: PASSIVE silently no-ops
+				// while readers are active.
 				try { db.exec(`PRAGMA wal_checkpoint(RESTART);`) } catch { /* ignore */ }
-
-				// Incremental FTS5 merge — DELETE on an FTS5-indexed row
-				// leaves a tombstone in the segment tree that only `merge`
-				// reclaims. Skipping this is the second compounding cause
-				// (after fixed-size vacuum) of the slow freelist accretion
-				// that took the DB to 17GB. 100 pages of merge work per
-				// retention tick is bounded and runs in milliseconds.
+				// FTS5 DELETE leaves tombstones only `merge` reclaims; 100
+				// pages per pass is bounded and runs in milliseconds.
 				incrementalFtsMerge(100)
-
-				// Actual page reclamation lives in `reclaimSpace`, which
-				// runs on its own faster cadence so the file shrinks even
-				// when no traces are evicted in a given retention tick (e.g.
-				// after a large historical eviction has already happened).
 			})
 		})
 
-		// Retention only runs in processes that opt in (currently the main
-		// daemon). The ingest worker and TUI skip it to avoid two writers
-		// competing for the write lock with overlapping DELETE passes.
+		// Retention only runs in processes that opt in. Exactly one writer
+		// per database may own it, and it must not be a thread that serves
+		// HTTP: every step below is synchronous SQLite work that scales with
+		// database size (observed 190-225s per pass on a 6.7GB file).
 		if (opts.runRetention) {
 			// Reconcile any summary drift from interrupted ingests, but do it
 			// after the server becomes healthy. Running this synchronously at
@@ -1063,6 +1193,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 					const mode = (db.query(`PRAGMA auto_vacuum`).get() as { auto_vacuum: number }).auto_vacuum
 					if (mode === 2) return // already INCREMENTAL
 					db.exec(`PRAGMA auto_vacuum = INCREMENTAL; VACUUM;`)
+					// VACUUM may renumber rowids in tables without an INTEGER
+					// PRIMARY KEY (spans), which the search indexes key on.
+					for (const index of SEARCH_INDEXES) {
+						if (searchIndexLayout(db, index) === "rowid") db.exec(`INSERT INTO ${index.table}(${index.table}) VALUES ('rebuild')`)
+					}
 				} catch { /* ignore — new DBs won't need this; conversion will retry next startup */ }
 			}))
 
@@ -1125,7 +1260,6 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				let insertedSpans = 0
 				const transaction = db.transaction((request: OtlpTraceExportRequest) => {
 					const touchedTraceIds = new Set<string>()
-					const touchedOperations: Array<readonly [string, string, string]> = []
 					for (const resourceSpans of request.resourceSpans ?? []) {
 						const resourceAttributes = attributeMap(resourceSpans.resource?.attributes)
 						const serviceName = resourceAttributes["service.name"] || resourceAttributes["service_name"] || "unknown"
@@ -1162,19 +1296,10 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 								)
 								deleteSpanAttributes.run(span.traceId, span.spanId)
 								insertSpanAttributesMany(span.traceId, span.spanId, mergedAttributes)
-								touchedOperations.push([span.traceId, span.spanId, span.name ?? "unknown"])
 								touchedTraceIds.add(span.traceId)
 								insertedSpans += 1
 							}
 						}
-					}
-					try {
-						const BATCH_SIZE = 500
-						for (let offset = 0; offset < touchedOperations.length; offset += BATCH_SIZE) {
-							updateSpanOperationSearchMany(touchedOperations.slice(offset, offset + BATCH_SIZE))
-						}
-					} catch {
-						// FTS is optional.
 					}
 					for (const traceId of touchedTraceIds) {
 						upsertTraceSummary.run(traceId)
@@ -1190,7 +1315,6 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			return yield* Effect.sync(() => {
 				let insertedLogs = 0
 				const transaction = db.transaction((request: OtlpLogExportRequest) => {
-					const touchedLogBodies: Array<readonly [string, string]> = []
 					for (const resourceLogs of request.resourceLogs ?? []) {
 						const resourceAttributes = attributeMap(resourceLogs.resource?.attributes)
 						const serviceName = resourceAttributes["service.name"] || resourceAttributes["service_name"] || "unknown"
@@ -1216,18 +1340,9 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 								)
 								const logId = Number((result as { lastInsertRowid: number | bigint }).lastInsertRowid)
 								insertLogAttributesMany(logId, mergedAttributes)
-								touchedLogBodies.push([String(logId), body])
 								insertedLogs += 1
 							}
 						}
-					}
-					try {
-						const BATCH_SIZE = 500
-						for (let offset = 0; offset < touchedLogBodies.length; offset += BATCH_SIZE) {
-							insertLogBodySearchMany(touchedLogBodies.slice(offset, offset + BATCH_SIZE))
-						}
-					} catch {
-						// FTS is optional.
 					}
 				})
 
@@ -1334,8 +1449,8 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 				if (input.operation) {
 					const ftsQuery = toFtsMatchQuery(input.operation)
-					if (hasFts && ftsQuery) {
-						clauses.push("trace_id IN (SELECT DISTINCT trace_id FROM span_operation_fts WHERE span_operation_fts MATCH ?)")
+					if (ftsQuery && searchReady()) {
+						clauses.push("trace_id IN (SELECT trace_id FROM spans WHERE rowid IN (SELECT rowid FROM span_operation_fts WHERE span_operation_fts MATCH ?))")
 						params.push(ftsQuery)
 					} else {
 						clauses.push("trace_id IN (SELECT DISTINCT trace_id FROM spans WHERE operation_name LIKE ? COLLATE NOCASE)")
@@ -1466,8 +1581,8 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				}
 				if (input.operation) {
 					const ftsQuery = toFtsMatchQuery(input.operation)
-					if (hasFts && ftsQuery) {
-						fromSql += ` INNER JOIN (SELECT trace_id, span_id FROM span_operation_fts WHERE span_operation_fts MATCH ?) AS span_operation_match ON span_operation_match.trace_id = s.trace_id AND span_operation_match.span_id = s.span_id`
+					if (ftsQuery && searchReady()) {
+						fromSql += ` INNER JOIN (SELECT rowid AS span_rowid FROM span_operation_fts WHERE span_operation_fts MATCH ?) AS span_operation_match ON span_operation_match.span_rowid = s.rowid`
 						joinParams.push(ftsQuery)
 					} else {
 						clauses.push("s.operation_name LIKE ? COLLATE NOCASE")
@@ -1616,8 +1731,8 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				}
 				if (input.body) {
 					const ftsQuery = toFtsMatchQuery(input.body)
-					if (hasFts && ftsQuery) {
-						clauses.push(`id IN (SELECT CAST(log_id AS INTEGER) FROM log_body_fts WHERE log_body_fts MATCH ?)`)
+					if (ftsQuery && searchReady()) {
+						clauses.push(`id IN (SELECT rowid FROM log_body_fts WHERE log_body_fts MATCH ?)`)
 						params.push(ftsQuery)
 					} else {
 						clauses.push(`body LIKE ? COLLATE NOCASE`)
@@ -2414,6 +2529,38 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			})
 		})
 
+		const fileBytesOrZero = (path: string): number => {
+			try { return statSync(path).size } catch { return 0 }
+		}
+
+		const databaseStats = Effect.fn("motel/TelemetryStore.databaseStats")(function* () {
+			return yield* Effect.sync((): DatabaseStats => {
+				const pageCount = (db.query(`PRAGMA page_count`).get() as { page_count: number }).page_count
+				const freelistPages = (db.query(`PRAGMA freelist_count`).get() as { freelist_count: number }).freelist_count
+				const pageSizeBytes = (db.query(`PRAGMA page_size`).get() as { page_size: number }).page_size
+				const effectiveBytes = Math.max(0, (pageCount - freelistPages) * pageSizeBytes)
+				const traceCount = (db.query(`SELECT COUNT(*) AS c FROM trace_summaries`).get() as { c: number }).c
+				const spanCount = (db.query(`SELECT COUNT(*) AS c FROM spans`).get() as { c: number }).c
+				const logCount = (db.query(`SELECT COUNT(*) AS c FROM logs`).get() as { c: number }).c
+				const oldest = db.query(`SELECT MIN(started_at_ms) AS m FROM trace_summaries`).get() as { m: number | null } | undefined
+				return {
+					databasePath: config.otel.databasePath,
+					fileBytes: fileBytesOrZero(config.otel.databasePath),
+					walBytes: fileBytesOrZero(`${config.otel.databasePath}-wal`),
+					pageCount,
+					freelistPages,
+					pageSizeBytes,
+					effectiveBytes,
+					traceCount,
+					spanCount,
+					logCount,
+					oldestTraceStartedAtMs: oldest?.m ?? null,
+					retentionHours: config.otel.retentionHours,
+					maxDbSizeMb: config.otel.maxDbSizeMb,
+				}
+			})
+		})()
+
 		return TelemetryStore.of({
 			ingestTraces,
 			ingestLogs,
@@ -2435,28 +2582,100 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 			searchAiCalls,
 			getAiCall,
 			aiCallStats,
+			databaseStats,
+			runRetentionPass: cleanupExpired(),
 		})
 	}),
 )
 
 /**
- * Default writer instance: the main daemon uses this. Owns schema
- * migrations, FTS backfill, and the retention loop.
+ * Standalone writer: owns schema migrations, FTS backfill, and the
+ * retention loop. For single-process users of the store (runtime.ts).
  */
 export const TelemetryStoreLive = makeTelemetryStoreLayer({ readonly: false, runRetention: true })
 
 /**
- * Writer instance that SKIPS retention. The ingest worker uses this
- * so the daemon and the worker aren't both running DELETE passes at
- * the same time (they'd just serialise behind the write lock and
- * duplicate work).
+ * The daemon's main-thread writer. Skips retention: in the daemon the
+ * ingest worker is the sole SQLite writer and owns the retention loop,
+ * so this thread never runs synchronous maintenance that would freeze
+ * the HTTP server.
  */
-export const TelemetryStoreWorkerLive = makeTelemetryStoreLayer({ readonly: false, runRetention: false })
+export const TelemetryStoreDaemonLive = makeTelemetryStoreLayer({ readonly: false, runRetention: false })
 
 /**
- * Read-only instance for query-only processes (currently the TUI).
- * Skips every DDL/DML statement at startup so the connection can be
- * opened while a writer is mid-transaction without racing for the
- * write lock. Writes through the service interface will throw.
+ * The ingest worker's writer. Runs retention alongside ingest on the
+ * same connection, so eviction never contends with ingest for the
+ * write lock and never blocks the daemon's event loop.
  */
-export const TelemetryStoreReadonlyLive = makeTelemetryStoreLayer({ readonly: true, runRetention: false })
+export const TelemetryStoreWorkerLive = makeTelemetryStoreLayer({ readonly: false, runRetention: true })
+
+const fileIdentity = (path: string): string | null => {
+	try {
+		const stat = statSync(path)
+		return `${stat.dev}:${stat.ino}`
+	} catch {
+		return null
+	}
+}
+
+/**
+ * Read-only instance for query-only processes (the TUI and the daemon's
+ * query path). Skips every DDL/DML statement at startup so the connection
+ * can be opened while a writer is mid-transaction without racing for the
+ * write lock. Writes through the service interface will throw.
+ *
+ * Follows the file: once the database at the configured path is replaced
+ * (`motel reset`), the next call reopens it. A connection left on the
+ * deleted file fails with "disk I/O error" and pins its disk space until
+ * the process exits.
+ */
+export const TelemetryStoreReadonlyLive = Layer.effect(
+	TelemetryStore,
+	Effect.gen(function* () {
+		const layer = makeTelemetryStoreLayer({ readonly: true, runRetention: false })
+		const open = Effect.gen(function* () {
+			const identity = fileIdentity(config.otel.databasePath)
+			const scope = yield* Scope.make()
+			// Fresh memo map: the ambient one would hand back the old connection.
+			const memoMap = yield* Layer.makeMemoMap
+			const context = yield* Layer.buildWithMemoMap(layer, memoMap, scope).pipe(
+				Effect.onError((cause) => Scope.close(scope, Exit.failCause(cause))),
+			)
+			return { identity, scope, store: Context.get(context, TelemetryStore) }
+		})
+
+		let current = yield* open
+		yield* Effect.addFinalizer(() => Scope.close(current.scope, Exit.void))
+		const reopenLock = yield* Semaphore.make(1)
+
+		const isCurrent = () => {
+			const identity = fileIdentity(config.otel.databasePath)
+			return identity === null || identity === current.identity
+		}
+		const currentStore = Effect.suspend(() =>
+			isCurrent()
+				? Effect.succeed(current.store)
+				: reopenLock.withPermits(1)(Effect.suspend(() => {
+					if (isCurrent()) return Effect.succeed(current.store)
+					return Effect.gen(function* () {
+						const previous = current
+						current = yield* open
+						yield* Scope.close(previous.scope, Exit.void)
+						return current.store
+					})
+				})),
+		)
+
+		type Store = TelemetryStore["Service"]
+		const delegate = (key: keyof Store): unknown => {
+			if (Effect.isEffect(current.store[key])) {
+				return Effect.flatMap(currentStore, (store) => store[key] as Effect.Effect<unknown, unknown>)
+			}
+			return (...args: ReadonlyArray<unknown>) =>
+				Effect.flatMap(currentStore, (store) => (store[key] as (...args: ReadonlyArray<unknown>) => Effect.Effect<unknown, unknown>)(...args))
+		}
+		return TelemetryStore.of(
+			Object.fromEntries((Object.keys(current.store) as Array<keyof Store>).map((key) => [key, delegate(key)])) as unknown as Store,
+		)
+	}),
+)

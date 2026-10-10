@@ -14,6 +14,15 @@ export const fitCell = (text: string, width: number, align: "left" | "right" = "
 	return align === "right" ? trimmed.padStart(width, " ") : trimmed.padEnd(width, " ")
 }
 
+export const formatBytes = (bytes: number): string => {
+	if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
+	const units = ["B", "KB", "MB", "GB", "TB"]
+	const exp = Math.min(units.length - 1, Math.floor(Math.log10(bytes) / 3))
+	const scaled = bytes / Math.pow(1000, exp)
+	const formatted = scaled >= 100 || exp === 0 ? scaled.toFixed(0) : scaled.toFixed(1)
+	return `${formatted} ${units[exp]}`
+}
+
 export const formatShortDate = (date: Date) => date.toLocaleDateString("en-US", { month: "numeric", day: "numeric" })
 
 export const formatTimestamp = (date: Date) => date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }).toLowerCase()
