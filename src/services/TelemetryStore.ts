@@ -914,8 +914,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 
 		const reconcileTraceSummaries = Effect.sync(() => {
 			try {
-				db.query(`DELETE FROM trace_summaries`).run()
-				rebuildTraceSummaries.run()
+				// One transaction, so readers never see the table empty mid-rebuild.
+				db.transaction(() => {
+					db.query(`DELETE FROM trace_summaries`).run()
+					rebuildTraceSummaries.run()
+				}).immediate()
 			} catch (err) {
 				if (!isSqliteLockError(err)) throw err
 				console.warn(`motel: trace summary rebuild skipped during startup: ${(err as Error).message}`)
