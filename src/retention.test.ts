@@ -135,8 +135,8 @@ describe("retention pass", () => {
 
 		const after = count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id LIKE 'big-%'`)
 		expect(after).toBeLessThan(before)
-		// One pass gets all the way under the cap.
-		expect((await run((store) => store.databaseStats)).effectiveBytes).toBeLessThanOrEqual(1024 * 1024)
+		// One pass runs down to 90% of the cap, leaving room for ingest before the next.
+		expect((await run((store) => store.databaseStats)).effectiveBytes).toBeLessThanOrEqual(0.9 * 1024 * 1024)
 		// Oldest goes first; the newest survives.
 		expect(count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id = 'big-0'`)).toBe(0)
 		expect(count(`SELECT COUNT(*) c FROM trace_summaries WHERE trace_id = 'big-${ingested - 1}'`)).toBe(1)

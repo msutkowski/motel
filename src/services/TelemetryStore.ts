@@ -977,6 +977,11 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 		// Size-cap batches per pass (× EVICT_BATCH_SIZE traces). Must outpace
 		// sustained ingest, observed at ~3k traces/min.
 		const EVICT_MAX_SIZE_BATCHES_PER_PASS = 200
+		// Size eviction starts above 95% of the cap and runs down to 90%. The
+		// gap must absorb one 60s pass of ingest (~28 MB observed) or live
+		// data overshoots the cap between passes.
+		const SIZE_EVICT_START_BYTES = maxDbSizeBytes * 0.95
+		const SIZE_EVICT_STOP_BYTES = maxDbSizeBytes * 0.9
 
 		const ftsTableNames = ["span_attr_fts", "log_body_fts", "span_operation_fts"] as const
 
@@ -1133,16 +1138,16 @@ export const makeTelemetryStoreLayer = (opts: TelemetryStoreOptions) => Layer.ef
 				yield* Effect.sleep(EVICT_BATCH_PAUSE)
 			}
 
-			// Size cap: oldest completed traces go first until live data fits.
-			// Batches are sized from the average trace footprint so a small
-			// overage doesn't take a whole batch with it.
+			// Size cap: oldest completed traces go first. Batches are sized from
+			// the average trace footprint so a small overage doesn't take a
+			// whole batch with it; bytesPerTrace is set once eviction starts.
 			let bytesPerTrace: number | undefined
 			for (let i = 0; i < EVICT_MAX_SIZE_BATCHES_PER_PASS; i++) {
 				const batch = yield* step("size", () => {
 					const live = liveBytes()
-					if (live <= maxDbSizeBytes) return []
+					if (live <= (bytesPerTrace === undefined ? SIZE_EVICT_START_BYTES : SIZE_EVICT_STOP_BYTES)) return []
 					bytesPerTrace ??= live / Math.max(1, (db.query(`SELECT COUNT(*) AS c FROM trace_summaries`).get() as { c: number }).c)
-					return selectOldestTraces(Math.min(EVICT_BATCH_SIZE, Math.ceil((live - maxDbSizeBytes) / bytesPerTrace)))
+					return selectOldestTraces(Math.min(EVICT_BATCH_SIZE, Math.ceil((live - SIZE_EVICT_STOP_BYTES) / bytesPerTrace)))
 				})
 				if (batch === undefined || batch.length === 0) break
 				const ok = yield* step("evict", () => { evictTraceBatch(batch); return true })
